@@ -3,393 +3,327 @@ import json
 import uuid
 from datetime import datetime
 
-from flask import Flask, request, jsonify
 import gspread
-from google.oauth2.service_account import Credentials
+from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client as TwilioClient
+from twilio.rest import Client
+from google.oauth2.service_account import Credentials
 
-
-# -----------------------------
-# APP
-# -----------------------------
+# =========================
+# CONFIG GENERAL
+# =========================
 app = Flask(__name__)
 
-# -----------------------------
-# ENV
-# -----------------------------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # (lo usaremos después)
-TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "TDLM_Sistema_Leads_v1")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
+# Twilio
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "whatsapp:+14155238886")  # sandbox o prod
 
-# -----------------------------
-# HELPERS: TIME
-# -----------------------------
-def now_iso():
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+# Credenciales Google (recomendado: JSON en variable de entorno)
+# En Render crea env var: GOOGLE_CREDENTIALS_JSON (todo el JSON)
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 
+# Nombre de pestañas (ajústalas a tus nombres reales)
+TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads")
+TAB_CONFIG = os.environ.get("TAB_CONFIG", "Config_XimenaAI")
+TAB_LOGS = os.environ.get("TAB_LOGS", "Logs_Mensajes")
 
-# -----------------------------
-# HELPERS: GSPREAD
-# -----------------------------
-_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-_gspread_book = None
-
-
-def _get_book():
-    global _gspread_book
-    if _gspread_book is not None:
-        return _gspread_book
-
+# =========================
+# GOOGLE SHEETS HELPERS
+# =========================
+def gs_client():
     if not GOOGLE_CREDENTIALS_JSON:
         raise RuntimeError("Falta GOOGLE_CREDENTIALS_JSON en variables de entorno (Render).")
 
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=_SCOPES)
-    client = gspread.authorize(creds)
-    _gspread_book = client.open(GOOGLE_SHEET_NAME)
-    return _gspread_book
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
 
+def ws(nombre_pestana: str):
+    client = gs_client()
+    sh = client.open(GOOGLE_SHEET_NAME)
+    return sh.worksheet(nombre_pestana)
 
-def ws(nombre):
-    return _get_book().worksheet(nombre)
+def header_map(worksheet):
+    """Mapea encabezados (fila 1) -> índice 1-based"""
+    headers = worksheet.row_values(1)
+    return {h.strip(): (i + 1) for i, h in enumerate(headers) if h and h.strip()}
 
-
-def normalize_text(s: str) -> str:
-    """Convierte '\\n' en saltos reales para WhatsApp."""
-    if not s:
+def get_cell_by_name(worksheet, row, col_name):
+    hm = header_map(worksheet)
+    col = hm.get(col_name)
+    if not col:
         return ""
-    return s.replace("\\n", "\n").strip()
+    return (worksheet.cell(row, col).value or "").strip()
 
-
-# -----------------------------
-# BD_Leads columns
-# -----------------------------
-COL = {
-    "ID_LEAD": 1,
-    "TELEFONO": 2,
-    "FUENTE": 3,
-    "FECHA_REG": 4,
-    "ULT_ACT": 5,
-    "ESTATUS": 6,
-    "AVISO_OK": 7,
-    "TIPO_CASO": 8,
-    "NOMBRE": 9,
-    "APELLIDO": 10,
-    "CORREO": 11,
-    "SITUACION": 12,
-    "ANALISIS_AI": 13,
-    "F_INICIO": 14,
-    "F_FIN": 15,
-    "SALARIO": 16,
-    "RESULTADO": 17,
-    "ABOGADO_ID": 18,
-    "ABOGADO_NOMBRE": 19,
-    "LINK_WA": 20,
-    "LINK_WEB": 21,
-    "TOKEN_WEB": 22,
-    "NOTAS_ABOG": 23,
-    "BLOQUEADO": 24,
-    "ULT_MSG": 25,
-}
-
-
-def buscar_fila_por_telefono(ws_leads, telefono: str):
-    """Busca el teléfono (columna B) y devuelve la fila o None."""
-    try:
-        col_values = ws_leads.col_values(COL["TELEFONO"])
-        try:
-            idx = col_values.index(telefono)
-            return idx + 1
-        except ValueError:
-            return None
-    except Exception:
-        try:
-            cell = ws_leads.find(telefono)
-            if cell is None:
-                return None
-            return cell.row
-        except Exception:
-            return None
-
-
-def detectar_fuente(msg: str):
-    m = (msg or "").lower()
-    if "facebook" in m or "face" in m:
-        return "FACEBOOK"
-    if "sitio" in m or "web" in m or "pagina" in m or "página" in m:
-        return "WEB"
-    return "DESCONOCIDA"
-
-
-def crear_lead(ws_leads, telefono: str, msg_inicial: str):
-    lead_id = str(uuid.uuid4())
-    fuente = detectar_fuente(msg_inicial)
-    token = str(uuid.uuid4()).replace("-", "")
-    link_web = ""
-
-    fila = [""] * 25
-    fila[COL["ID_LEAD"] - 1] = lead_id
-    fila[COL["TELEFONO"] - 1] = telefono
-    fila[COL["FUENTE"] - 1] = fuente
-    fila[COL["FECHA_REG"] - 1] = now_iso()
-    fila[COL["ULT_ACT"] - 1] = now_iso()
-    fila[COL["ESTATUS"] - 1] = "INICIO"
-    fila[COL["TOKEN_WEB"] - 1] = token
-    fila[COL["LINK_WEB"] - 1] = link_web
-    fila[COL["ULT_MSG"] - 1] = msg_inicial
-
-    ws_leads.append_row(fila, value_input_option="RAW")
-    return lead_id, fuente
-
-
-def obtener(ws_leads, row: int, col_key: str):
-    try:
-        return ws_leads.cell(row, COL[col_key]).value
-    except Exception:
-        return ""
-
-
-def actualizar(ws_leads, row: int, col_key: str, value: str) -> bool:
-    """Actualiza solo si col_key existe en COL. Si no, regresa False (sin tronar)."""
-    if col_key not in COL:
+def set_cell_by_name(worksheet, row, col_name, value):
+    hm = header_map(worksheet)
+    col = hm.get(col_name)
+    if not col:
         return False
-    try:
-        ws_leads.update_cell(row, COL[col_key], value)
-        return True
-    except Exception:
-        return False
+    worksheet.update_cell(row, col, value)
+    return True
 
-
-# -----------------------------
-# Config_XimenaAI helpers
-# -----------------------------
-def get_config_row(paso_id: str):
-    """
-    Devuelve un dict con la configuración del paso.
-    Columnas esperadas:
-    A ID_Paso | B Orden | C Texto_Bot | D Tipo_Entrada | E Opciones_Validas
-    F Siguiente_Si_1 | G Siguiente_Si_2 | H Campo_BD_Leads_A_Actualizar
-    I Regla_Validacion | J Mensaje_Error
-    """
-    cfg = ws("Config_XimenaAI")
-    c = cfg.find(paso_id)
-    if c is None:
+def buscar_fila_por_telefono(ws_leads, telefono):
+    hm = header_map(ws_leads)
+    col_tel = hm.get("Telefono")
+    if not col_tel:
         return None
 
-    r = c.row
+    col_vals = ws_leads.col_values(col_tel)
+    for idx, v in enumerate(col_vals, start=1):
+        if idx == 1:
+            continue
+        if (v or "").strip() == telefono.strip():
+            return idx
+    return None
+
+def obtener_paso_actual(ws_leads, row):
+    """
+    Lee ESTATUS o Estatus_Chat (compatibilidad).
+    Si no hay, regresa INICIO.
+    """
+    paso = get_cell_by_name(ws_leads, row, "ESTATUS")
+    if not paso:
+        paso = get_cell_by_name(ws_leads, row, "Estatus_Chat")
+    return paso if paso else "INICIO"
+
+def guardar_paso_actual(ws_leads, row, nuevo_paso):
+    """
+    Escribe en ESTATUS si existe; si no, en Estatus_Chat.
+    """
+    if set_cell_by_name(ws_leads, row, "ESTATUS", nuevo_paso):
+        return True
+    return set_cell_by_name(ws_leads, row, "Estatus_Chat", nuevo_paso)
+
+def crear_lead(ws_leads, telefono, msg_inicial):
+    hm = header_map(ws_leads)
+    new_row = [""] * len(hm)
+
+    def put(col, val):
+        c = hm.get(col)
+        if c:
+            new_row[c - 1] = val
+
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    id_lead = str(uuid.uuid4())
+
+    fuente = "FACEBOOK" if "facebook" in msg_inicial.lower() else "WHATSAPP"
+
+    put("ID_Lead", id_lead)
+    put("Telefono", telefono)
+    put("Fuente_Lead", fuente)
+    put("Fecha_Registro", now)
+    put("Ultima_Actualizacion", now)
+    put("Ultimo_Mensaje_Cliente", msg_inicial)
+
+    # Paso inicial
+    if "ESTATUS" in hm:
+        put("ESTATUS", "INICIO")
+    elif "Estatus_Chat" in hm:
+        put("Estatus_Chat", "INICIO")
+
+    ws_leads.append_row(new_row, value_input_option="RAW")
+    return id_lead
+
+def log_mensaje(ws_logs, telefono, id_lead, paso, msg_in, msg_out, canal="WHATSAPP", fuente="FACEBOOK", modelo="", error=""):
+    hm = header_map(ws_logs)
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = [""] * len(hm)
+
+    def put(col, val):
+        c = hm.get(col)
+        if c:
+            row[c - 1] = val
+
+    put("ID_Log", str(uuid.uuid4()))
+    put("Fecha_Hora", now)
+    put("Telefono", telefono)
+    put("ID_Lead", id_lead)
+    put("Paso", paso)
+    put("Mensaje_Entrante", msg_in)
+    put("Mensaje_Saliente", msg_out)
+    put("Canal", canal)
+    put("Fuente_Lead", fuente)
+    put("Modelo_AI", modelo)
+    put("Errores", error)
+
+    ws_logs.append_row(row, value_input_option="RAW")
+
+# =========================
+# CONFIG_XIMENAAI HELPERS
+# =========================
+def cfg_get_by_paso(ws_cfg, id_paso):
+    """
+    Busca en Config_XimenaAI por ID_Paso (col A) usando find().
+    No usamos gspread.exceptions.CellNotFound para evitar incompatibilidades.
+    """
+    try:
+        cell = ws_cfg.find(id_paso)
+    except Exception:
+        cell = None
+
+    if not cell:
+        return None
+
+    r = cell.row
+    # Ajustado a tu layout:
+    # A ID_Paso
+    # C Texto_Bot
+    # D Tipo_Entrada
+    # E Opciones_Validas
+    # F Siguiente_Si_1
+    # G Siguiente_Si_2
+    # H Campo_BD_Leads_A_Actualizar
+    # J Mensaje_Error
     return {
-        "ID_PASO": cfg.cell(r, 1).value or "",
-        "ORDEN": cfg.cell(r, 2).value or "",
-        "TEXTO_BOT": cfg.cell(r, 3).value or "",
-        "TIPO_ENTRADA": (cfg.cell(r, 4).value or "").strip().upper(),
-        "OPCIONES_VALIDAS": (cfg.cell(r, 5).value or "").strip(),
-        "SIGUIENTE_SI_1": (cfg.cell(r, 6).value or "").strip(),
-        "SIGUIENTE_SI_2": (cfg.cell(r, 7).value or "").strip(),
-        "CAMPO_ACTUALIZAR": (cfg.cell(r, 8).value or "").strip(),
-        "REGLA_VALIDACION": (cfg.cell(r, 9).value or "").strip(),
-        "MENSAJE_ERROR": (cfg.cell(r, 10).value or "").strip(),
+        "row": r,
+        "ID_Paso": ws_cfg.cell(r, 1).value or "",
+        "Texto_Bot": ws_cfg.cell(r, 3).value or "",
+        "Tipo_Entrada": (ws_cfg.cell(r, 4).value or "").strip().upper(),
+        "Opciones_Validas": (ws_cfg.cell(r, 5).value or "").strip(),
+        "Siguiente_Si_1": (ws_cfg.cell(r, 6).value or "").strip(),
+        "Siguiente_Si_2": (ws_cfg.cell(r, 7).value or "").strip(),
+        "Campo_BD_Leads_A_Actualizar": (ws_cfg.cell(r, 8).value or "").strip(),
+        "Mensaje_Error": (ws_cfg.cell(r, 10).value or "Responde con una opción válida.").strip(),
     }
 
-
-def get_text_for_step(paso_id: str) -> str:
-    conf = get_config_row(paso_id)
-    if not conf:
-        return f"[No existe Config_XimenaAI para {paso_id}]"
-    return normalize_text(conf["TEXTO_BOT"]) or f"[Config vacía en {paso_id}]"
-
-
-def parse_opciones_validas(s: str):
-    # "1,2" -> {"1","2"}
-    if not s:
-        return set()
-    return {x.strip() for x in s.split(",") if x.strip()}
-
-
-# -----------------------------
-# Chat_Log
-# -----------------------------
-def log_chat(telefono: str, lead_id: str, paso: str, msg_in: str, msg_out: str, canal="WHATSAPP", fuente="", errores=""):
-    try:
-        wl = ws("Chat_Log")
-        fila = [
-            str(uuid.uuid4()),
-            now_iso(),
-            telefono,
-            lead_id,
-            paso,
-            msg_in or "",
-            msg_out or "",
-            canal,
-            fuente or "",
-            "",          # Modelo_AI
-            errores or ""  # Errores
-        ]
-        wl.append_row(fila, value_input_option="RAW")
-    except Exception:
-        pass
-
-
-# -----------------------------
-# FLOW ENGINE (OPCIONES)
-# -----------------------------
-def procesar_paso(ws_leads, row: int, telefono: str, msg_cliente: str):
-    """
-    Motor de flujo:
-    - Lee ESTATUS actual
-    - Lee config de ese paso
-    - Si OPCIONES: valida y avanza a siguiente
-    - Devuelve (texto_respuesta, paso_log, errores)
-    """
-    lead_id = obtener(ws_leads, row, "ID_LEAD")
-    fuente = obtener(ws_leads, row, "FUENTE") or ""
-
-    estatus = (obtener(ws_leads, row, "ESTATUS") or "INICIO").strip()
-
-    conf = get_config_row(estatus)
-    if not conf:
-        texto = f"[No existe Config_XimenaAI para {estatus}]"
-        return texto, estatus, fuente, ""
-
-    tipo = conf["TIPO_ENTRADA"]
-
-    # PASOS "SISTEMA": solo muestra texto y no espera validación
-    if tipo == "SISTEMA":
-        texto = normalize_text(conf["TEXTO_BOT"])
-        return texto, estatus, fuente, ""
-
-    # PASOS "OPCIONES": valida 1/2, decide siguiente y actualiza
-    if tipo == "OPCIONES":
-        opciones = parse_opciones_validas(conf["OPCIONES_VALIDAS"])
-        r = (msg_cliente or "").strip()
-
-        if r not in opciones:
-            msg_err = normalize_text(conf["MENSAJE_ERROR"]) or "Por favor responde con una opción válida."
-            return msg_err, estatus, fuente, ""
-
-        # Guardar respuesta en BD_Leads si corresponde
-        errores = ""
-        campo = conf["CAMPO_ACTUALIZAR"]
-        if campo:
-            ok = actualizar(ws_leads, row, campo, r)
-            if not ok:
-                errores = f"Campo_BD_Leads_A_Actualizar inválido o no existe en COL: {campo}"
-
-        # Siguiente paso
-        if r == "1":
-            siguiente = conf["SIGUIENTE_SI_1"] or ""
-        else:
-            siguiente = conf["SIGUIENTE_SI_2"] or ""
-
-        if not siguiente:
-            # Si no hay siguiente definido, nos quedamos en el mismo estatus
-            texto = normalize_text(conf["TEXTO_BOT"])
-            return texto, estatus, fuente, errores
-
-        # Actualiza ESTATUS al siguiente paso
-        actualizar(ws_leads, row, "ESTATUS", siguiente)
-
-        # Respuesta = texto del siguiente paso
-        texto_siguiente = get_text_for_step(siguiente)
-        return texto_siguiente, siguiente, fuente, errores
-
-    # Si no reconocemos tipo, devolvemos el texto del paso
-    texto = normalize_text(conf["TEXTO_BOT"])
-    return texto, estatus, fuente, f"Tipo_Entrada no soportado: {tipo}"
-
-
-# -----------------------------
-# ROUTES
-# -----------------------------
-@app.route("/", methods=["GET", "POST"])
-def root():
-    return "OK", 200
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "service": "tuderecho-leads", "time": now_iso()})
-
-
-@app.route("/health/sheets", methods=["GET"])
-def health_sheets():
-    ws_leads = ws("BD_Leads")
-    a1 = ws_leads.acell("A1").value
-    return jsonify({"ok": True, "sheet": GOOGLE_SHEET_NAME, "BD_Leads_A1": a1})
-
-
+# =========================
+# RUTA WHATSAPP (TWILIO)
+# =========================
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    try:
-        msg_cliente = (request.values.get("Body", "") or "").strip()
-        telefono = (request.values.get("From", "") or "").strip()
-        resp = MessagingResponse()
+    msg_cliente = (request.values.get("Body", "") or "").strip()
+    telefono = (request.values.get("From", "") or "").strip()
 
-        ws_leads = ws("BD_Leads")
+    resp = MessagingResponse()
+
+    ws_leads = ws(TAB_LEADS)
+    ws_cfg = ws(TAB_CONFIG)
+    ws_logs = ws(TAB_LOGS)
+
+    # 1) Buscar o crear lead
+    row = buscar_fila_por_telefono(ws_leads, telefono)
+    if not row:
+        id_lead = crear_lead(ws_leads, telefono, msg_cliente)
         row = buscar_fila_por_telefono(ws_leads, telefono)
+    else:
+        id_lead = get_cell_by_name(ws_leads, row, "ID_Lead")
 
-        # NUEVO LEAD: crea y manda INICIO
-        if row is None:
-            lead_id, fuente = crear_lead(ws_leads, telefono, msg_cliente)
-            texto = get_text_for_step("INICIO")
-            resp.message(texto)
-            log_chat(telefono, lead_id, "INICIO", msg_cliente, texto, fuente=fuente)
+    # 2) Paso actual REAL del lead
+    paso_actual = obtener_paso_actual(ws_leads, row)
+
+    # 3) Obtener config del paso actual
+    cfg = cfg_get_by_paso(ws_cfg, paso_actual)
+    if not cfg:
+        msg_out = f"[No existe Config_XimenaAI para {paso_actual}]"
+        resp.message(msg_out)
+        log_mensaje(ws_logs, telefono, id_lead, paso_actual, msg_cliente, msg_out, error="CONFIG_NOT_FOUND")
+        return str(resp)
+
+    # 4) Si paso_actual es INICIO:
+    #    La primera vez el cliente manda "Hola..." (no es 1/2)
+    #    Respondemos con texto de INICIO y esperamos el siguiente mensaje (1 o 2)
+    if paso_actual == "INICIO" and msg_cliente and msg_cliente not in ["1", "2"]:
+        msg_out = cfg["Texto_Bot"]
+        resp.message(msg_out)
+
+        # actualizar timestamp / último mensaje
+        set_cell_by_name(ws_leads, row, "Ultima_Actualizacion", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+        set_cell_by_name(ws_leads, row, "Ultimo_Mensaje_Cliente", msg_cliente)
+
+        log_mensaje(ws_logs, telefono, id_lead, paso_actual, msg_cliente, msg_out)
+        return str(resp)
+
+    # 5) Procesamiento por tipo de entrada
+    tipo = cfg["Tipo_Entrada"]
+
+    if tipo == "OPCIONES":
+        validas = [x.strip() for x in cfg["Opciones_Validas"].split(",") if x.strip()]
+        if msg_cliente not in validas:
+            resp.message(cfg["Mensaje_Error"])
+            log_mensaje(ws_logs, telefono, id_lead, paso_actual, msg_cliente, cfg["Mensaje_Error"], error="OPCION_INVALIDA")
             return str(resp)
 
-        # EXISTENTE: procesa paso actual (motor)
-        lead_id = obtener(ws_leads, row, "ID_LEAD")
-        fuente = obtener(ws_leads, row, "FUENTE") or ""
+        # guardar respuesta en campo indicado (si existe)
+        campo_guardar = cfg["Campo_BD_Leads_A_Actualizar"]
+        if campo_guardar:
+            set_cell_by_name(ws_leads, row, campo_guardar, msg_cliente)
 
-        # Auditoría
-        actualizar(ws_leads, row, "ULT_ACT", now_iso())
-        actualizar(ws_leads, row, "ULT_MSG", msg_cliente)
+        # avanzar a siguiente paso según 1/2
+        nuevo_paso = cfg["Siguiente_Si_1"] if msg_cliente == "1" else cfg["Siguiente_Si_2"]
+        if nuevo_paso:
+            guardar_paso_actual(ws_leads, row, nuevo_paso)
 
-        texto_out, paso_log, fuente_log, errores = procesar_paso(ws_leads, row, telefono, msg_cliente)
+        # actualizar timestamps
+        set_cell_by_name(ws_leads, row, "Ultima_Actualizacion", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+        set_cell_by_name(ws_leads, row, "Ultimo_Mensaje_Cliente", msg_cliente)
 
-        resp.message(texto_out)
-        log_chat(telefono, lead_id, paso_log, msg_cliente, texto_out, fuente=fuente_log or fuente, errores=errores)
+        # responder con texto del siguiente paso
+        cfg_next = cfg_get_by_paso(ws_cfg, nuevo_paso) if nuevo_paso else None
+        if not cfg_next:
+            msg_out = "Listo. (No hay siguiente paso configurado)"
+            resp.message(msg_out)
+            log_mensaje(ws_logs, telefono, id_lead, nuevo_paso or paso_actual, msg_cliente, msg_out, error="NEXT_STEP_NOT_FOUND")
+            return str(resp)
+
+        msg_out = cfg_next["Texto_Bot"]
+        resp.message(msg_out)
+        log_mensaje(ws_logs, telefono, id_lead, cfg_next["ID_Paso"], msg_cliente, msg_out)
         return str(resp)
 
-    except Exception:
-        resp = MessagingResponse()
-        resp.message("Estamos teniendo un detalle técnico. Por favor intenta nuevamente en 1 minuto.")
-        return str(resp)
+    # Si no es OPCIONES, por ahora solo devolvemos el texto del paso
+    msg_out = cfg["Texto_Bot"] or "OK"
+    resp.message(msg_out)
+    log_mensaje(ws_logs, telefono, id_lead, paso_actual, msg_cliente, msg_out, error="TIPO_NO_IMPLEMENTADO")
+    return str(resp)
 
-
+# =========================
+# RUTA NOTIFICAR (APPSHEET)
+# =========================
 @app.route("/notificar", methods=["POST"])
-def notificar():
-    data = request.get_json(force=True, silent=True) or {}
+def enviar_notificacion():
+    data = request.json or {}
+    numero_cliente = data.get("telefono", "")
+    tipo_noticia = data.get("tipo", "")
+    fecha_cita = data.get("fecha", "")
+    lugar = data.get("lugar", "Oficinas del Despacho")
 
-    numero_cliente = (data.get("telefono") or "").strip()
-    mensaje = (data.get("mensaje") or "").strip()
+    client = Client(TWILIO_SID, TWILIO_TOKEN)
 
-    if not numero_cliente or not mensaje:
-        return jsonify({"status": "error", "message": "Faltan campos: telefono y mensaje"}), 400
+    cuerpo_mensaje = (
+        f"⚖️ *NOTIFICACIÓN LEGAL*\n\n"
+        f"Hola, te informamos de una actualización en tu proceso:\n"
+        f"🔹 *Evento:* {tipo_noticia}\n"
+        f"📅 *Fecha:* {fecha_cita}\n"
+        f"📍 *Lugar:* {lugar}\n\n"
+        f"Para más detalles o ver tu expediente, entra aquí: https://tuderecholaboral.mx/mi-caso"
+    )
 
-    if not TWILIO_SID or not TWILIO_TOKEN:
-        return jsonify({"status": "error", "message": "Twilio no configurado (SID/TOKEN)"}), 500
-
-    client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
     try:
-        m = client.messages.create(
-            body=mensaje,
-            from_=TWILIO_WHATSAPP_NUMBER,
+        message = client.messages.create(
+            body=cuerpo_mensaje,
+            from_=TWILIO_NUMBER,
             to=numero_cliente
         )
-        return jsonify({"status": "success", "sid": m.sid}), 200
+        return jsonify({"status": "success", "sid": message.sid}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# =========================
+# HEALTHCHECK
+# =========================
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "tuderecho-leads"}), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    # Render usa PORT
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
