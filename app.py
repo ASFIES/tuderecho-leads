@@ -1,162 +1,310 @@
 import os
-import json
 import re
+import json
 import uuid
 from datetime import datetime, timezone
 
-from flask import Flask, request
+import gspread
+from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 
-import gspread
-from google.oauth2.service_account import Credentials
-
 # =========================
-# CONFIG (ENV)
+# CONFIG (Render Env Vars)
 # =========================
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "TDLM_Sistema_Leads_v1")
 
+# Puedes usar UNA de estas 2:
+# 1) GOOGLE_CREDS_JSON = contenido JSON completo del service account (recomendado en Render)
+# 2) GOOGLE_CREDS_FILE = ruta a archivo json (local dev)
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
+GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "credenciales.json")
+
+# Nombres de pestañas (si cambian en Sheets, cámbialos aquí o ponlos en env vars)
 TAB_LEADS  = os.environ.get("TAB_LEADS", "BD_Leads")
 TAB_CONFIG = os.environ.get("TAB_CONFIG", "Config_XimenaAI")
-TAB_LOGS   = os.environ.get("TAB_LOGS", "Logs_Mensajes")
-TAB_KB     = os.environ.get("TAB_KB", "Conocimiento_AI")  # opcional
+TAB_LOGS   = os.environ.get("TAB_LOGS", "BD_Logs")  # ajusta si tu pestaña se llama distinto
 
-# Credenciales Google: JSON completo (recomendado) o ruta de archivo.
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-GOOGLE_CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "credenciales.json")
+# Default behavior
+DEFAULT_ERROR_MSG = "⚠️ No pude procesar tu respuesta. Por favor intenta de nuevo."
+DEFAULT_MISSING_CONFIG_MSG = "⚠️ No encuentro configuración para este paso. Un abogado te contactará."
 
-# OpenAI opcional (solo si Tipo_Entrada = CHATGPT)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-
-# =========================
-# APP
-# =========================
 app = Flask(__name__)
 
 # =========================
-# HELPERS
+# Helpers: Time + Text
 # =========================
 def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def clean_text(s: str) -> str:
+def normalize_phone(raw_from: str) -> str:
+    # Twilio manda "whatsapp:+52..."
+    return (raw_from or "").strip()
+
+def detect_fuente(first_message: str) -> str:
+    txt = (first_message or "").lower()
+    if "facebook" in txt:
+        return "FACEBOOK"
+    if "sitio" in txt or "web" in txt or "pagina" in txt:
+        return "SITIO_WEB"
+    return "DESCONOCIDA"
+
+def clean(s: str) -> str:
     return (s or "").strip()
 
-def detect_fuente_lead(msg_inicial: str) -> str:
-    t = (msg_inicial or "").lower()
-    if "facebook" in t or "fb" in t:
-        return "FACEBOOK"
-    if "sitio" in t or "web" in t or "pagina" in t:
-        return "WEB"
-    return "WHATSAPP"  # default genérico
+def only_digits(s: str) -> str:
+    return re.sub(r"\D+", "", s or "")
 
-def normalize_phone(from_value: str) -> str:
-    # Twilio manda "whatsapp:+521..."
-    return clean_text(from_value)
-
-def parse_opcion(msg: str) -> str:
-    # Tomamos primer dígito si existe ("1", "1.", "1 Sí", etc.)
-    m = re.search(r"\b(\d+)\b", msg or "")
-    return m.group(1) if m else clean_text(msg)
+def is_valid_date_ddmmyyyy(s: str) -> bool:
+    if not s:
+        return False
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", s.strip())
+    if not m:
+        return False
+    d, mo, y = map(int, m.groups())
+    try:
+        datetime(y, mo, d)
+        return True
+    except ValueError:
+        return False
 
 # =========================
-# GOOGLE SHEETS (ROBUSTO)
+# Google Sheets Connection
 # =========================
 def get_gspread_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
-    if GOOGLE_CREDENTIALS_JSON:
-        info = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        return gspread.authorize(creds)
+    if GOOGLE_CREDS_JSON:
+        info = json.loads(GOOGLE_CREDS_JSON)
+        return gspread.service_account_from_dict(info)
+    return gspread.service_account(filename=GOOGLE_CREDS_FILE)
 
-    # fallback a archivo en repo
-    creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=scopes)
-    return gspread.authorize(creds)
-
-_gc = None
-
-def gc():
-    global _gc
-    if _gc is None:
-        _gc = get_gspread_client()
-    return _gc
-
-def sh():
-    return gc().open(GOOGLE_SHEET_NAME)
-
-def ws(nombre_hoja: str):
-    """
-    Nunca truena: si no existe la hoja, regresa None (y el webhook no muere).
-    """
+def open_ws(spread, title: str):
+    # Evita StopIteration: regresa None si no existe
     try:
-        return sh().worksheet(nombre_hoja)
+        return spread.worksheet(title)
     except Exception:
         return None
 
-def get_headers_map(worksheet):
+def header_map(ws):
     """
-    Regresa dict: { "NombreColumna": index_1based }
+    Devuelve dict: {header_name: col_index (1-based)}
+    Si no hay headers, devuelve {}.
     """
-    if worksheet is None:
+    try:
+        headers = ws.row_values(1)
+        m = {}
+        for i, h in enumerate(headers, start=1):
+            h2 = (h or "").strip()
+            if h2:
+                m[h2] = i
+        return m
+    except Exception:
         return {}
-    headers = worksheet.row_values(1)
-    return {h.strip(): i + 1 for i, h in enumerate(headers) if h.strip()}
 
-def find_row_by_value(worksheet, header_map, col_name, value):
-    """
-    Busca fila por valor exacto en columna col_name. Si no encuentra, regresa None.
-    """
-    if worksheet is None:
-        return None
-    col_idx = header_map.get(col_name)
-    if not col_idx:
-        return None
+def get_first_existing_col(hmap, candidates):
+    for c in candidates:
+        if c in hmap:
+            return hmap[c]
+    return None
+
+def safe_cell(ws, row, col):
     try:
-        # gspread find busca en toda la hoja, pero nosotros limitamos a la columna
-        col_values = worksheet.col_values(col_idx)
-        for r, v in enumerate(col_values, start=1):
-            if r == 1:
-                continue
-            if clean_text(v) == clean_text(value):
-                return r
+        return clean(ws.cell(row, col).value)
+    except Exception:
+        return ""
+
+def safe_update(ws, row, col, value):
+    try:
+        ws.update_cell(row, col, value)
+        return True
+    except Exception:
+        return False
+
+def safe_append(ws, values):
+    try:
+        ws.append_row(values, value_input_option="USER_ENTERED")
+        return True
+    except Exception:
+        return False
+
+# =========================
+# Logging
+# =========================
+def safe_log(spread, data: dict):
+    ws = open_ws(spread, TAB_LOGS)
+    if not ws:
+        # Si no existe pestaña logs, no tronar el webhook
+        return
+
+    h = header_map(ws)
+    # Espera headers tipo:
+    # ID_Log, Fecha_Hora, Telefono, ID_Lead, Paso, Mensaje_Entrante, Mensaje_Saliente, Canal, Fuente_Lead, Modelo_AI, Errores
+    row = [""] * max(11, len(h) if h else 11)
+
+    def put(key, val):
+        if not h:
+            return
+        if key in h:
+            idx = h[key] - 1
+            if idx >= len(row):
+                row.extend([""] * (idx - len(row) + 1))
+            row[idx] = val
+
+    put("ID_Log", data.get("ID_Log", str(uuid.uuid4())))
+    put("Fecha_Hora", data.get("Fecha_Hora", now_iso()))
+    put("Telefono", data.get("Telefono", ""))
+    put("ID_Lead", data.get("ID_Lead", ""))
+    put("Paso", data.get("Paso", ""))
+    put("Mensaje_Entrante", data.get("Mensaje_Entrante", ""))
+    put("Mensaje_Saliente", data.get("Mensaje_Saliente", ""))
+    put("Canal", data.get("Canal", "WHATSAPP"))
+    put("Fuente_Lead", data.get("Fuente_Lead", ""))
+    put("Modelo_AI", data.get("Modelo_AI", ""))
+    put("Errores", data.get("Errores", ""))
+
+    # Si no hay headers, igual intenta append "crudo"
+    if not h:
+        safe_append(ws, [
+            data.get("ID_Log", str(uuid.uuid4())),
+            data.get("Fecha_Hora", now_iso()),
+            data.get("Telefono", ""),
+            data.get("ID_Lead", ""),
+            data.get("Paso", ""),
+            data.get("Mensaje_Entrante", ""),
+            data.get("Mensaje_Saliente", ""),
+            "WHATSAPP",
+            data.get("Fuente_Lead", ""),
+            data.get("Modelo_AI", ""),
+            data.get("Errores", ""),
+        ])
+        return
+
+    safe_append(ws, row)
+
+# =========================
+# Leads (BD_Leads)
+# =========================
+def find_lead_row_by_phone(ws_leads, phone):
+    # Busca en columna "Telefono" si existe
+    h = header_map(ws_leads)
+    col_phone = get_first_existing_col(h, ["Telefono", "TELEFONO", "phone", "Phone"])
+    if not col_phone:
         return None
+
+    # Búsqueda manual robusta (evita cell.find que a veces se rompe con formatos)
+    try:
+        all_vals = ws_leads.col_values(col_phone)
+        for i in range(2, len(all_vals) + 1):
+            if clean(all_vals[i - 1]) == phone:
+                return i
     except Exception:
         return None
 
-def safe_update_cell(worksheet, header_map, row, col_name, value):
-    """
-    Actualiza solo si existe columna.
-    """
-    if worksheet is None:
-        return
-    col_idx = header_map.get(col_name)
-    if not col_idx:
-        return
-    worksheet.update_cell(row, col_idx, value)
+    return None
 
-def safe_append_row(worksheet, row_values):
-    if worksheet is None:
-        return
-    worksheet.append_row(row_values, value_input_option="USER_ENTERED")
+def create_new_lead(ws_leads, phone, first_msg):
+    h = header_map(ws_leads)
+    lead_id = str(uuid.uuid4())
+    fuente = detect_fuente(first_msg)
+
+    col_id = get_first_existing_col(h, ["ID_Lead", "ID_LEAD"])
+    col_phone = get_first_existing_col(h, ["Telefono", "TELEFONO"])
+    col_fuente = get_first_existing_col(h, ["Fuente_Lead", "FUENTE_LEAD"])
+    col_freg = get_first_existing_col(h, ["Fecha_Registro", "FECHA_REGISTRO"])
+    col_update = get_first_existing_col(h, ["Ultima_Actualizacion", "ULTIMA_ACTUALIZACION"])
+    col_status = get_first_existing_col(h, ["Estatus_Chat", "ESTATUS", "Status", "STATUS"])
+
+    # Construye fila del tamaño de headers
+    ncols = max(len(h), 20)
+    row = [""] * ncols
+
+    def setc(col, val):
+        if col and col >= 1:
+            if col - 1 >= len(row):
+                row.extend([""] * (col - len(row)))
+            row[col - 1] = val
+
+    setc(col_id, lead_id)
+    setc(col_phone, phone)
+    setc(col_fuente, fuente)
+    setc(col_freg, now_iso())
+    setc(col_update, now_iso())
+    setc(col_status, "INICIO")
+
+    ok = safe_append(ws_leads, row)
+    return lead_id if ok else lead_id
+
+def get_lead_status(ws_leads, lead_row):
+    h = header_map(ws_leads)
+    col_status = get_first_existing_col(h, ["Estatus_Chat", "ESTATUS", "Status", "STATUS"])
+    if not col_status:
+        return "INICIO"
+    return safe_cell(ws_leads, lead_row, col_status) or "INICIO"
+
+def set_lead_status(ws_leads, lead_row, status):
+    h = header_map(ws_leads)
+    col_status = get_first_existing_col(h, ["Estatus_Chat", "ESTATUS", "Status", "STATUS"])
+    if col_status:
+        safe_update(ws_leads, lead_row, col_status, status)
+    # también actualiza Ultima_Actualizacion si existe
+    col_update = get_first_existing_col(h, ["Ultima_Actualizacion", "ULTIMA_ACTUALIZACION"])
+    if col_update:
+        safe_update(ws_leads, lead_row, col_update, now_iso())
+
+def set_lead_field(ws_leads, lead_row, field_name, value):
+    """
+    field_name debe ser un header REAL en BD_Leads, ej: "Aviso_Privacidad_Aceptado", "Tipo_Caso", etc.
+    Si no existe, no truena.
+    """
+    h = header_map(ws_leads)
+    if field_name in h:
+        safe_update(ws_leads, lead_row, h[field_name], value)
+        # update timestamp
+        col_update = get_first_existing_col(h, ["Ultima_Actualizacion", "ULTIMA_ACTUALIZACION"])
+        if col_update:
+            safe_update(ws_leads, lead_row, col_update, now_iso())
+        return True
+    return False
+
+def get_lead_id(ws_leads, lead_row):
+    h = header_map(ws_leads)
+    col_id = get_first_existing_col(h, ["ID_Lead", "ID_LEAD"])
+    return safe_cell(ws_leads, lead_row, col_id) if col_id else ""
 
 # =========================
-# CONFIG FLOW
+# Config (Config_XimenaAI)
 # =========================
-def load_config_row(ws_config, cfg_headers, paso_id):
+def load_config_row(ws_config, paso_id):
     """
-    Busca en Config_XimenaAI la fila con ID_Paso = paso_id.
-    Retorna dict con datos.
+    Busca la fila donde ID_Paso == paso_id.
+    Devuelve dict con:
+      Texto_Bot, Tipo_Entrada, Opciones_Validas, Siguiente_Si_1, Siguiente_Si_2,
+      Campo_BD_Leads_A_Actualizar, Mensaje_Error
+    Si no existe, devuelve None.
     """
-    if ws_config is None:
+    h = header_map(ws_config)
+
+    # Headers esperados
+    col_idpaso = get_first_existing_col(h, ["ID_Paso", "ID_PASO"])
+    if not col_idpaso:
         return None
 
-    row = find_row_by_value(ws_config, cfg_headers, "ID_Paso", paso_id)
-    if not row:
+    # Buscar fila manual
+    try:
+        ids = ws_config.col_values(col_idpaso)
+        row = None
+        for i in range(2, len(ids) + 1):
+            if clean(ids[i - 1]) == paso_id:
+                row = i
+                break
+        if not row:
+            return None
+    except Exception:
         return None
 
-    def v(col):
-        idx = cfg_headers.get(col)
-        return ws_config.cell(row, idx).value.strip() if idx else ""
+    def v(header_name):
+        idx = h.get(header_name)
+        if not idx:
+            return ""
+        return safe_cell(ws_config, row, idx)
 
     return {
         "row": row,
@@ -167,297 +315,196 @@ def load_config_row(ws_config, cfg_headers, paso_id):
         "Siguiente_Si_1": v("Siguiente_Si_1"),
         "Siguiente_Si_2": v("Siguiente_Si_2"),
         "Campo_BD_Leads_A_Actualizar": v("Campo_BD_Leads_A_Actualizar"),
-        "Regla_Validacion": v("Regla_Validacion"),
-        "Mensaje_Error": v("Mensaje_Error"),
+        "Mensaje_Error": v("Mensaje_Error") or DEFAULT_ERROR_MSG,
     }
 
-def opciones_validas_set(opciones_str: str):
-    # "1,2" -> {"1","2"}
-    parts = [p.strip() for p in (opciones_str or "").split(",") if p.strip()]
-    return set(parts)
-
-def format_bot_text(texto: str):
-    # En tu Sheet tienes \n\n, aquí lo convertimos a saltos reales
-    t = texto or ""
-    t = t.replace("\\n", "\n")
-    return t.strip()
-
-# =========================
-# AI (opcional y simple)
-# =========================
-def respuesta_ai_simple(descripcion: str):
-    # Por ahora, seguro y neutro:
-    # (Luego lo conectamos a KB + OpenAI)
-    return ("Gracias. Estoy analizando tu situación. "
-            "En este momento estamos en pruebas; en breve un abogado revisará tu caso. "
-            "Mientras tanto, evita firmar documentos sin asesoría.")
+def build_options_text(texto_bot, opciones_validas):
+    # Para WhatsApp: mandamos 1/2 en texto (evita botones por restricciones)
+    # opciones_validas "1,2"
+    ops = [o.strip() for o in (opciones_validas or "").split(",") if o.strip()]
+    if not ops:
+        return texto_bot
+    out = texto_bot.strip() + "\n\n"
+    # Por defecto: 1 Sí / 2 No (si tu config ya trae el texto, no dupliques)
+    if "¿" in texto_bot or "?" in texto_bot:
+        pass
+    # mostramos las opciones genéricas
+    if "1" in ops:
+        out += "1) Sí\n"
+    if "2" in ops:
+        out += "2) No\n"
+    return out.strip()
 
 # =========================
-# LOGGING
+# Validation + Next Step
 # =========================
-def log_event(ws_logs, logs_headers, payload: dict):
-    """
-    Inserta en Logs_Mensajes si existe.
-    Columnas esperadas (si existen): ID_Log, Fecha_Hora, Telefono, ID_Lead, Paso, Mensaje_Entrante,
-    Mensaje_Saliente, Canal, Fuente_Lead, Modelo_AI, Errores
-    """
-    if ws_logs is None:
-        return
+def validate_and_next(cfg, user_msg):
+    tipo = cfg.get("Tipo_Entrada", "TEXTO")
+    msg = clean(user_msg)
 
-    # Si tu hoja tiene headers distintos, igual no truena: solo mete en el orden existente.
-    headers = ws_logs.row_values(1)
-    row = []
-    for h in headers:
-        key = h.strip()
-        row.append(payload.get(key, ""))
-    safe_append_row(ws_logs, row)
+    if tipo == "OPCIONES":
+        valid = [o.strip() for o in (cfg.get("Opciones_Validas") or "").split(",") if o.strip()]
+        if msg not in valid:
+            return False, None, cfg.get("Mensaje_Error") or "Responde con una opción válida."
+        if msg == "1":
+            return True, cfg.get("Siguiente_Si_1") or "", ""
+        if msg == "2":
+            return True, cfg.get("Siguiente_Si_2") or "", ""
+        # si algún día agregas 3/4, aquí se amplía
+        return True, cfg.get("Siguiente_Si_1") or "", ""
+
+    if tipo == "FECHA":
+        if not is_valid_date_ddmmyyyy(msg):
+            return False, None, cfg.get("Mensaje_Error") or "Usa formato DD/MM/AAAA."
+        return True, cfg.get("Siguiente_Si_1") or "", ""
+
+    if tipo == "NUMERO":
+        # acepta 10,000 o 10000.50
+        m = msg.replace(",", "")
+        try:
+            float(m)
+            return True, cfg.get("Siguiente_Si_1") or "", ""
+        except Exception:
+            return False, None, cfg.get("Mensaje_Error") or "Indica un número válido."
+
+    # TEXTO, CHATGPT, SISTEMA
+    return True, cfg.get("Siguiente_Si_1") or "", ""
 
 # =========================
-# ENDPOINTS
+# Webhook: WhatsApp
 # =========================
-@app.route("/", methods=["GET"])
-def home():
-    return "OK - Tu Derecho Laboral Leads", 200
-
 @app.route("/health", methods=["GET"])
 def health():
-    # Prueba de conexión a sheets sin tumbar
-    _ = ws(TAB_LEADS)
-    return "OK", 200
+    return jsonify({"status": "ok", "time": now_iso()}), 200
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    """
-    Webhook Twilio WhatsApp:
-    - Busca/crea lead
-    - Usa Estatus_Chat como paso actual
-    - Lee Config_XimenaAI para validar y avanzar
-    - Loggea en Logs_Mensajes
-    """
     resp = MessagingResponse()
 
-    msg_in = clean_text(request.values.get("Body", ""))
-    from_phone = normalize_phone(request.values.get("From", ""))
+    from_phone = normalize_phone(request.values.get("From"))
+    msg_in = clean(request.values.get("Body"))
 
-    # Sheets
-    ws_leads = ws(TAB_LEADS)
-    ws_config = ws(TAB_CONFIG)
-    ws_logs = ws(TAB_LOGS)
-
-    leads_headers = get_headers_map(ws_leads)
-    cfg_headers = get_headers_map(ws_config)
-    logs_headers = get_headers_map(ws_logs)
-
-    # Si falta BD_Leads o Config, respondemos sin caer
-    if ws_leads is None or ws_config is None:
-        resp.message("Estamos en mantenimiento. Intenta de nuevo en unos minutos.")
+    # Conecta a Google
+    try:
+        gc = get_gspread_client()
+        spread = gc.open(GOOGLE_SHEET_NAME)
+    except Exception as e:
+        out = "⚠️ Servicio activo, pero no puedo abrir Google Sheets. Revisa credenciales."
+        resp.message(out)
         return str(resp)
 
-    # Buscar lead por Telefono
-    lead_row = find_row_by_value(ws_leads, leads_headers, "Telefono", from_phone)
+    ws_leads = open_ws(spread, TAB_LEADS)
+    ws_config = open_ws(spread, TAB_CONFIG)
 
-    # Si NO existe lead: lo creamos y mandamos INICIO
+    if not ws_leads:
+        out = f"⚠️ No existe la pestaña {TAB_LEADS} en tu Google Sheet."
+        resp.message(out)
+        return str(resp)
+
+    if not ws_config:
+        out = f"⚠️ No existe la pestaña {TAB_CONFIG} en tu Google Sheet."
+        resp.message(out)
+        return str(resp)
+
+    # 1) Buscar lead
+    lead_row = find_lead_row_by_phone(ws_leads, from_phone)
+
+    # 2) Si no existe lead: crear y enviar INICIO
     if not lead_row:
-        new_id = str(uuid.uuid4())
-        fuente = detect_fuente_lead(msg_in)
-        # Campos mínimos (solo si existen columnas)
-        # Creamos la fila completa en el orden de headers de BD_Leads
-        headers = ws_leads.row_values(1)
-        data = {h: "" for h in headers}
-
-        data["ID_Lead"] = new_id
-        data["Telefono"] = from_phone
-        data["Fuente_Lead"] = fuente
-        data["Fecha_Registro"] = now_iso()
-        data["Ultima_Actualizacion"] = now_iso()
-        data["Estatus_Chat"] = "INICIO"
-
-        # Guarda el primer mensaje del cliente si existe columna
-        if "Ultimo_Mensaje_Cliente" in data:
-            data["Ultimo_Mensaje_Cliente"] = msg_in
-
-        row_to_append = [data.get(h, "") for h in headers]
-        safe_append_row(ws_leads, row_to_append)
-
-        # Respuesta INICIO desde Config
-        cfg = load_config_row(ws_config, cfg_headers, "INICIO")
+        lead_id = create_new_lead(ws_leads, from_phone, msg_in)
+        cfg = load_config_row(ws_config, "INICIO")
         if not cfg:
-            text_out = "Hola, soy Ximena. Estamos en pruebas. En breve te atenderemos."
-        else:
-            text_out = format_bot_text(cfg["Texto_Bot"])
+            out = DEFAULT_MISSING_CONFIG_MSG + " (Falta paso INICIO en Config)"
+            resp.message(out)
+            safe_log(spread, {
+                "Telefono": from_phone, "ID_Lead": lead_id, "Paso": "INICIO",
+                "Mensaje_Entrante": msg_in, "Mensaje_Saliente": out,
+                "Fuente_Lead": detect_fuente(msg_in), "Errores": "No existe config INICIO"
+            })
+            return str(resp)
 
+        text_out = build_options_text(cfg["Texto_Bot"], cfg["Opciones_Validas"])
         resp.message(text_out)
 
-        log_event(ws_logs, logs_headers, {
-            "ID_Log": str(uuid.uuid4()),
-            "Fecha_Hora": now_iso(),
-            "Telefono": from_phone,
-            "ID_Lead": new_id,
-            "Paso": "INICIO",
-            "Mensaje_Entrante": msg_in,
-            "Mensaje_Saliente": text_out,
-            "Canal": "WHATSAPP",
-            "Fuente_Lead": fuente,
-            "Modelo_AI": "",
-            "Errores": "",
+        safe_log(spread, {
+            "Telefono": from_phone, "ID_Lead": lead_id, "Paso": "INICIO",
+            "Mensaje_Entrante": msg_in, "Mensaje_Saliente": text_out,
+            "Fuente_Lead": detect_fuente(msg_in), "Errores": ""
         })
-
         return str(resp)
 
-    # Si ya existe lead: procesar paso actual
-    lead_id = ws_leads.cell(lead_row, leads_headers.get("ID_Lead")).value if leads_headers.get("ID_Lead") else ""
-    paso_actual = ws_leads.cell(lead_row, leads_headers.get("Estatus_Chat")).value if leads_headers.get("Estatus_Chat") else "INICIO"
-    paso_actual = (paso_actual or "INICIO").strip()
+    # 3) Lead existe
+    lead_id = get_lead_id(ws_leads, lead_row)
+    paso_actual = get_lead_status(ws_leads, lead_row)
+    cfg = load_config_row(ws_config, paso_actual)
 
-    cfg = load_config_row(ws_config, cfg_headers, paso_actual)
     if not cfg:
-        # Si no hay config del paso actual, regresamos a INICIO sin caer
-        cfg_inicio = load_config_row(ws_config, cfg_headers, "INICIO")
-        text_out = format_bot_text(cfg_inicio["Texto_Bot"]) if cfg_inicio else "Hola, soy Ximena. En breve te atendemos."
-        safe_update_cell(ws_leads, leads_headers, lead_row, "Estatus_Chat", "INICIO")
-        safe_update_cell(ws_leads, leads_headers, lead_row, "Ultima_Actualizacion", now_iso())
-        resp.message(text_out)
-        log_event(ws_logs, logs_headers, {
-            "ID_Log": str(uuid.uuid4()),
-            "Fecha_Hora": now_iso(),
-            "Telefono": from_phone,
-            "ID_Lead": lead_id,
-            "Paso": paso_actual,
-            "Mensaje_Entrante": msg_in,
-            "Mensaje_Saliente": text_out,
-            "Canal": "WHATSAPP",
-            "Fuente_Lead": ws_leads.cell(lead_row, leads_headers.get("Fuente_Lead")).value if leads_headers.get("Fuente_Lead") else "",
-            "Modelo_AI": "",
-            "Errores": f"No existe Config para paso {paso_actual}",
+        out = DEFAULT_MISSING_CONFIG_MSG + f" (Falta paso {paso_actual} en Config)"
+        resp.message(out)
+        safe_log(spread, {
+            "Telefono": from_phone, "ID_Lead": lead_id, "Paso": paso_actual,
+            "Mensaje_Entrante": msg_in, "Mensaje_Saliente": out,
+            "Fuente_Lead": "", "Errores": f"No existe config: {paso_actual}"
         })
         return str(resp)
 
-    tipo = cfg["Tipo_Entrada"]
+    # 4) Validar respuesta y determinar siguiente paso
+    ok, next_step, err = validate_and_next(cfg, msg_in)
+    if not ok:
+        resp.message(err or DEFAULT_ERROR_MSG)
+        safe_log(spread, {
+            "Telefono": from_phone, "ID_Lead": lead_id, "Paso": paso_actual,
+            "Mensaje_Entrante": msg_in, "Mensaje_Saliente": err or DEFAULT_ERROR_MSG,
+            "Errores": f"Validación fallida en {paso_actual}"
+        })
+        return str(resp)
 
-    # Guardar último mensaje del cliente (si existe columna)
-    safe_update_cell(ws_leads, leads_headers, lead_row, "Ultimo_Mensaje_Cliente", msg_in)
+    # 5) Guardar dato en BD_Leads si corresponde
+    campo = clean(cfg.get("Campo_BD_Leads_A_Actualizar", ""))
+    if campo:
+        # OJO: aquí se guarda en un HEADER REAL de BD_Leads (ej Aviso_Privacidad_Aceptado, Tipo_Caso, etc.)
+        # Tu ajuste: AVISO_OK lo cambiaste, pero mejor es guardar en Aviso_Privacidad_Aceptado (si ya existe).
+        # Este script NO truena si no existe.
+        set_lead_field(ws_leads, lead_row, campo, msg_in)
 
-    # Validación y avance
-    siguiente_paso = None
-    error_txt = ""
-    valor_a_guardar = ""
-
-    if tipo == "OPCIONES":
-        opcion = parse_opcion(msg_in)
-        validas = opciones_validas_set(cfg["Opciones_Validas"])
-        if validas and opcion not in validas:
-            error_txt = cfg["Mensaje_Error"] or "Por favor responde con una opción válida."
-        else:
-            valor_a_guardar = opcion
-            if opcion == "1":
-                siguiente_paso = cfg["Siguiente_Si_1"]
-            elif opcion == "2":
-                siguiente_paso = cfg["Siguiente_Si_2"]
-            else:
-                # Si hay más opciones algún día
-                siguiente_paso = cfg["Siguiente_Si_1"] or "INICIO"
-
-    elif tipo in ("TEXTO", "NUMERO", "FECHA"):
-        # Aquí solo validamos básico; reglas avanzadas luego.
-        valor_a_guardar = msg_in
-
-        if tipo == "NUMERO":
-            # limpiar $ y comas
-            raw = re.sub(r"[^\d.]", "", msg_in)
-            if raw == "":
-                error_txt = cfg["Mensaje_Error"] or "Indica un número válido."
-            else:
-                valor_a_guardar = raw
-
-        if tipo == "FECHA":
-            # acepta DD/MM/AAAA
-            if not re.match(r"^\d{2}/\d{2}/\d{4}$", msg_in):
-                error_txt = cfg["Mensaje_Error"] or "Usa el formato DD/MM/AAAA."
-
-        if not error_txt:
-            siguiente_paso = cfg["Siguiente_Si_1"] or "INICIO"
-
-    elif tipo == "CHATGPT":
-        valor_a_guardar = msg_in
-        siguiente_paso = cfg["Siguiente_Si_1"] or "INICIO"
-
-    elif tipo == "SISTEMA":
-        # Paso informativo, no espera input; re-envía mismo texto
-        siguiente_paso = cfg["Siguiente_Si_1"] or "INICIO"
-
+    # 6) Cambiar estatus al siguiente paso
+    if next_step:
+        set_lead_status(ws_leads, lead_row, next_step)
     else:
-        # desconocido
-        error_txt = "Configuración inválida del bot. (Tipo_Entrada)"
-    
-    # Si hay error, repetimos el texto del paso actual + Mensaje_Error
-    if error_txt:
-        text_out = f"{format_bot_text(cfg['Texto_Bot'])}\n\n{error_txt}".strip()
-        resp.message(text_out)
-        safe_update_cell(ws_leads, leads_headers, lead_row, "Ultima_Actualizacion", now_iso())
+        # si no hay siguiente, no tronar
+        next_step = paso_actual
 
-        log_event(ws_logs, logs_headers, {
-            "ID_Log": str(uuid.uuid4()),
-            "Fecha_Hora": now_iso(),
-            "Telefono": from_phone,
-            "ID_Lead": lead_id,
-            "Paso": paso_actual,
-            "Mensaje_Entrante": msg_in,
-            "Mensaje_Saliente": text_out,
-            "Canal": "WHATSAPP",
-            "Fuente_Lead": ws_leads.cell(lead_row, leads_headers.get("Fuente_Lead")).value if leads_headers.get("Fuente_Lead") else "",
-            "Modelo_AI": "",
-            "Errores": error_txt,
-        })
-        return str(resp)
-
-    # Guardar en BD_Leads el campo indicado por config (si existe)
-    campo_update = clean_text(cfg["Campo_BD_Leads_A_Actualizar"])
-    if campo_update:
-        safe_update_cell(ws_leads, leads_headers, lead_row, campo_update, valor_a_guardar)
-
-    # Si es paso CHATGPT, generamos respuesta y la guardamos en Analisis_AI (si existe)
-    modelo_ai = ""
-    if tipo == "CHATGPT":
-        ai_text = respuesta_ai_simple(msg_in)
-        modelo_ai = "AI_SIMPLE"
-        safe_update_cell(ws_leads, leads_headers, lead_row, "Analisis_AI", ai_text)
-
-    # Avanzar Estatus_Chat
-    if not siguiente_paso:
-        siguiente_paso = "INICIO"
-
-    safe_update_cell(ws_leads, leads_headers, lead_row, "Estatus_Chat", siguiente_paso)
-    safe_update_cell(ws_leads, leads_headers, lead_row, "Ultima_Actualizacion", now_iso())
-
-    # Responder con el siguiente paso (texto del bot)
-    cfg_next = load_config_row(ws_config, cfg_headers, siguiente_paso)
+    # 7) Responder con el texto del siguiente paso (si existe config)
+    cfg_next = load_config_row(ws_config, next_step)
     if not cfg_next:
-        text_out = "Gracias. En breve un abogado te contactará."
-    else:
-        text_out = format_bot_text(cfg_next["Texto_Bot"])
+        out = DEFAULT_MISSING_CONFIG_MSG + f" (Falta paso {next_step} en Config)"
+        resp.message(out)
+        safe_log(spread, {
+            "Telefono": from_phone, "ID_Lead": lead_id, "Paso": next_step,
+            "Mensaje_Entrante": msg_in, "Mensaje_Saliente": out,
+            "Errores": f"No existe config next_step: {next_step}"
+        })
+        return str(resp)
 
-        # Si el siguiente paso es OPCIONES y quieres que se vean las opciones, ya vienen en Texto_Bot.
-        # (Si no vienen, agrégalas en Sheet en el Texto_Bot.)
+    # Si el siguiente paso es SISTEMA, también puede mandar texto_bot y finalizar
+    tipo_next = cfg_next.get("Tipo_Entrada", "TEXTO")
+    if tipo_next == "OPCIONES":
+        text_out = build_options_text(cfg_next["Texto_Bot"], cfg_next["Opciones_Validas"])
+    else:
+        text_out = cfg_next["Texto_Bot"] or DEFAULT_ERROR_MSG
 
     resp.message(text_out)
 
-    log_event(ws_logs, logs_headers, {
-        "ID_Log": str(uuid.uuid4()),
-        "Fecha_Hora": now_iso(),
-        "Telefono": from_phone,
-        "ID_Lead": lead_id,
-        "Paso": paso_actual,
-        "Mensaje_Entrante": msg_in,
-        "Mensaje_Saliente": text_out,
-        "Canal": "WHATSAPP",
-        "Fuente_Lead": ws_leads.cell(lead_row, leads_headers.get("Fuente_Lead")).value if leads_headers.get("Fuente_Lead") else "",
-        "Modelo_AI": modelo_ai,
-        "Errores": "",
+    safe_log(spread, {
+        "Telefono": from_phone, "ID_Lead": lead_id, "Paso": next_step,
+        "Mensaje_Entrante": msg_in, "Mensaje_Saliente": text_out,
+        "Errores": ""
     })
-
     return str(resp)
 
-
+# =========================
+# MAIN (local dev)
+# =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
