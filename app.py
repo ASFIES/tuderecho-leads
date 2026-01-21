@@ -26,7 +26,6 @@ TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+141
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "TDLM_Sistema_Leads_v1")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
-
 # -----------------------------
 # HELPERS: TIME
 # -----------------------------
@@ -98,19 +97,35 @@ COL = {
 
 
 def buscar_fila_por_telefono(ws_leads, telefono: str):
-    """Busca el teléfono en la hoja. Devuelve row o None."""
+    """
+    Devuelve el número de fila (int) donde está el teléfono, o None si no existe.
+    Versión ultra-robusta: evita depender de gspread.exceptions.CellNotFound
+    y evita el caso cell=None.
+    """
     try:
-        cell = ws_leads.find(telefono)
-        return cell.row
-    except gspread.exceptions.CellNotFound:
-        return None
+        # Busca en columna B (Telefono) para que sea rápido y determinista
+        col_values = ws_leads.col_values(COL["TELEFONO"])  # incluye encabezado
+        try:
+            idx = col_values.index(telefono)
+            return idx + 1  # Sheets es 1-based
+        except ValueError:
+            return None
+    except Exception:
+        # Si por alguna razón col_values falla, fallback a find() sin romper
+        try:
+            cell = ws_leads.find(telefono)
+            if cell is None:
+                return None
+            return cell.row
+        except Exception:
+            return None
 
 
 def detectar_fuente(msg: str):
     m = (msg or "").lower()
     if "facebook" in m or "face" in m:
         return "FACEBOOK"
-    if "sitio" in m or "web" in m or "pagina" in m:
+    if "sitio" in m or "web" in m or "pagina" in m or "página" in m:
         return "WEB"
     return "DESCONOCIDA"
 
@@ -119,6 +134,7 @@ def crear_lead(ws_leads, telefono: str, msg_inicial: str):
     lead_id = str(uuid.uuid4())
     fuente = detectar_fuente(msg_inicial)
     token = str(uuid.uuid4()).replace("-", "")
+
     # Link reporte: lo afinamos después; por ahora placeholder
     link_web = ""
 
@@ -137,29 +153,38 @@ def crear_lead(ws_leads, telefono: str, msg_inicial: str):
     return lead_id, fuente
 
 
-def obtener_lead_id(ws_leads, row: int):
-    return ws_leads.cell(row, COL["ID_LEAD"]).value
+def obtener(ws_leads, row: int, col_key: str):
+    try:
+        return ws_leads.cell(row, COL[col_key]).value
+    except Exception:
+        return ""
 
 
 def actualizar(ws_leads, row: int, col_key: str, value: str):
-    ws_leads.update_cell(row, COL[col_key], value)
+    try:
+        ws_leads.update_cell(row, COL[col_key], value)
+        return True
+    except Exception:
+        return False
 
 
 # -----------------------------
 # HELPERS: CONFIG_XimenaAI
 # -----------------------------
 def get_config_text(id_paso: str):
-    """Lee Config_XimenaAI: busca ID_Paso en col A y toma Texto_Bot en col C (o col 3)."""
-    cfg = ws("Config_XimenaAI")
+    """
+    Lee Config_XimenaAI: busca ID_Paso en col A y toma Texto_Bot en col C (col 3).
+    Si no existe o está vacío, devuelve un placeholder para que nunca truene.
+    """
     try:
+        cfg = ws("Config_XimenaAI")
         c = cfg.find(id_paso)
-        # Asumimos columnas: A=ID_Paso, B=Orden, C=Texto_Bot
+        if c is None:
+            return f"[No existe Config_XimenaAI para {id_paso}]"
         texto = cfg.cell(c.row, 3).value
-        if not texto:
-            return f"[Config vacía en {id_paso}]"
-        return texto
-    except gspread.exceptions.CellNotFound:
-        return f"[No existe Config_XimenaAI para {id_paso}]"
+        return texto if texto else f"[Config vacía en {id_paso}]"
+    except Exception:
+        return f"[Error leyendo Config_XimenaAI: {id_paso}]"
 
 
 # -----------------------------
@@ -190,6 +215,12 @@ def log_chat(telefono: str, lead_id: str, paso: str, msg_in: str, msg_out: str, 
 # -----------------------------
 # ROUTES
 # -----------------------------
+@app.route("/", methods=["GET", "POST"])
+def root():
+    # Evita ruido de 404 si algún callback pega a /
+    return "OK", 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "service": "tuderecho-leads", "time": now_iso()})
@@ -204,58 +235,73 @@ def health_sheets():
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    # Twilio manda form-urlencoded
-    msg_cliente = (request.values.get("Body", "") or "").strip()
-    telefono = (request.values.get("From", "") or "").strip()  # "whatsapp:+521..."
-    resp = MessagingResponse()
+    """
+    Webhook de Twilio: recibe mensaje entrante y responde.
+    Por ahora:
+    - Si no existe lead: crea y manda INICIO
+    - Si existe y COMPLETADO: manda menú cliente
+    - Si existe y no completado: manda INICIO (en el PASO 5 hacemos flujo completo)
+    """
+    try:
+        msg_cliente = (request.values.get("Body", "") or "").strip()
+        telefono = (request.values.get("From", "") or "").strip()  # "whatsapp:+521..."
+        resp = MessagingResponse()
 
-    ws_leads = ws("BD_Leads")
+        ws_leads = ws("BD_Leads")
+        row = buscar_fila_por_telefono(ws_leads, telefono)
 
-    row = buscar_fila_por_telefono(ws_leads, telefono)
+        # NUEVO LEAD
+        if row is None:
+            lead_id, fuente = crear_lead(ws_leads, telefono, msg_cliente)
+            texto = get_config_text("INICIO")
+            resp.message(texto)
+            log_chat(telefono, lead_id, "INICIO", msg_cliente, texto, fuente=fuente)
+            return str(resp)
 
-    # 1) Si NO existe, crear lead y mandar INICIO
-    if row is None:
-        lead_id, fuente = crear_lead(ws_leads, telefono, msg_cliente)
+        # LEAD EXISTENTE
+        lead_id = obtener(ws_leads, row, "ID_LEAD")
+        estatus = obtener(ws_leads, row, "ESTATUS") or "INICIO"
+        fuente = obtener(ws_leads, row, "FUENTE") or ""
+
+        # Actualizar auditoría mínima
+        actualizar(ws_leads, row, "ULT_ACT", now_iso())
+        actualizar(ws_leads, row, "ULT_MSG", msg_cliente)
+
+        if estatus == "COMPLETADO":
+            nombre = obtener(ws_leads, row, "NOMBRE") or ""
+            texto = (
+                f"Hola {nombre}".strip() + " esperamos te encuentres bien. ¿Qué opción deseas?\n\n"
+                "1) Próximas fechas agendadas\n"
+                "2) Resumen de mi caso hasta hoy\n"
+                "3) Contactar a mi abogado"
+            )
+            resp.message(texto)
+            log_chat(telefono, lead_id, "MENU_CLIENTE", msg_cliente, texto, fuente=fuente)
+            return str(resp)
+
+        # En proceso: por ahora reenvía INICIO hasta que activemos el flujo completo
         texto = get_config_text("INICIO")
         resp.message(texto)
         log_chat(telefono, lead_id, "INICIO", msg_cliente, texto, fuente=fuente)
         return str(resp)
 
-    # 2) Si existe, mandar menú básico (por ahora) o retomar estatus
-    lead_id = obtener_lead_id(ws_leads, row)
-    estatus = ws_leads.cell(row, COL["ESTATUS"]).value or "INICIO"
-    fuente = ws_leads.cell(row, COL["FUENTE"]).value or ""
-
-    # Guardamos último mensaje + última actualización
-    actualizar(ws_leads, row, "ULT_ACT", now_iso())
-    actualizar(ws_leads, row, "ULT_MSG", msg_cliente)
-
-    # Si está COMPLETADO, menú de cliente registrado
-    if estatus == "COMPLETADO":
-        nombre = ws_leads.cell(row, COL["NOMBRE"]).value or ""
-        texto = (
-            f"Hola {nombre}".strip() + " esperamos te encuentres bien. ¿Qué opción deseas?\n\n"
-            "1) Próximas fechas agendadas\n"
-            "2) Resumen de mi caso hasta hoy\n"
-            "3) Contactar a mi abogado"
-        )
-        resp.message(texto)
-        log_chat(telefono, lead_id, "MENU_CLIENTE", msg_cliente, texto, fuente=fuente)
+    except Exception as e:
+        # Respuesta segura para que Twilio no reintente indefinidamente
+        resp = MessagingResponse()
+        resp.message("Estamos teniendo un detalle técnico. Por favor intenta nuevamente en 1 minuto.")
         return str(resp)
-
-    # Si no está completado: por ahora solo volvemos a INICIO hasta que armemos el flujo completo en el PASO 4
-    texto = get_config_text("INICIO")
-    resp.message(texto)
-    log_chat(telefono, lead_id, "INICIO", msg_cliente, texto, fuente=fuente)
-    return str(resp)
 
 
 @app.route("/notificar", methods=["POST"])
 def notificar():
-    """Webhook para AppSheet: envía mensaje proactivo por WhatsApp."""
+    """
+    Webhook para AppSheet: envía mensaje proactivo por WhatsApp.
+    Body JSON esperado:
+      { "telefono": "whatsapp:+521...", "mensaje": "texto..." }
+    """
     data = request.get_json(force=True, silent=True) or {}
 
-    numero_cliente = (data.get("telefono") or "").strip()  # debe venir "whatsapp:+52..."
+    numero_cliente = (data.get("telefono") or "").strip()
     mensaje = (data.get("mensaje") or "").strip()
 
     if not numero_cliente or not mensaje:
