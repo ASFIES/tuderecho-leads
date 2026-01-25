@@ -51,8 +51,7 @@ def phone_raw(raw: str) -> str:
 
 def phone_norm(raw: str) -> str:
     s = (raw or "").strip()
-    s = s.replace("whatsapp:", "").strip()  # "+52..."
-    return s
+    return s.replace("whatsapp:", "").strip()  # "+52..."
 
 
 def normalize_msg(s: str) -> str:
@@ -190,7 +189,6 @@ def safe_log(ws_logs, data: dict):
 
 # =========================
 # Alias de campos Config -> BD_Leads
-# (para tu caso AVISO_OK)
 # =========================
 FIELD_ALIASES = {
     "AVISO_OK": "Aviso_Privacidad_Aceptado",
@@ -200,14 +198,12 @@ FIELD_ALIASES = {
 def resolve_leads_field(leads_headers: dict, requested_field: str) -> str:
     if not requested_field:
         return ""
-    # si existe tal cual
     if col_idx(leads_headers, requested_field):
         return requested_field
-    # si existe alias
     alias = FIELD_ALIASES.get(requested_field)
     if alias and col_idx(leads_headers, alias):
         return alias
-    return requested_field  # se queda como venía (para log de error)
+    return requested_field
 
 
 # =========================
@@ -218,21 +214,18 @@ def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_norm: st
     if not tel_col:
         raise RuntimeError("En BD_Leads falta la columna 'Telefono'.")
 
-    # busca por RAW (whatsapp:+...)
     row = find_row_by_value(ws_leads, tel_col, tel_raw)
-    # busca por NORMALIZADO (+...) por si algún lead viejo lo guardó así
     if not row:
         row = find_row_by_value(ws_leads, tel_col, tel_norm)
 
     if row:
         idx_id = col_idx(leads_headers, "ID_Lead")
         idx_est = col_idx(leads_headers, "ESTATUS")
-        vals = ws_leads.row_values(row)  # 1 llamada
+        vals = ws_leads.row_values(row)
         lead_id = (vals[idx_id - 1] if idx_id and idx_id - 1 < len(vals) else "") or ""
         estatus = (vals[idx_est - 1] if idx_est and idx_est - 1 < len(vals) else "") or ""
         return row, lead_id.strip(), estatus.strip(), False
 
-    # crear nuevo
     lead_id = str(uuid.uuid4())
     header_row = ws_leads.row_values(1)
     new_row = [""] * max(1, len(header_row))
@@ -243,7 +236,7 @@ def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_norm: st
             new_row[idx - 1] = val
 
     set_if("ID_Lead", lead_id)
-    set_if("Telefono", tel_raw)  # importante: guardar RAW consistente
+    set_if("Telefono", tel_raw)
     set_if("Fuente_Lead", fuente or "FACEBOOK")
     set_if("Fecha_Registro", now_iso())
     set_if("Ultima_Actualizacion", now_iso())
@@ -256,7 +249,7 @@ def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_norm: st
 
 
 # =========================
-# Config: load con control de fallback
+# Config: load sin fallback al cargar SIGUIENTE
 # =========================
 def load_config_row(ws_config, paso: str, allow_fallback_inicio: bool = False):
     cfg_headers = build_header_map(ws_config)
@@ -265,17 +258,15 @@ def load_config_row(ws_config, paso: str, allow_fallback_inicio: bool = False):
         raise RuntimeError("En Config_XimenaAI falta la columna 'ID_Paso'.")
 
     paso = (paso or "").strip() or "INICIO"
-
     row = find_row_by_value(ws_config, idpaso_col, paso)
 
-    # ⚠️ SOLO si está permitido, caemos a INICIO
     if not row and allow_fallback_inicio and paso != "INICIO":
         row = find_row_by_value(ws_config, idpaso_col, "INICIO")
 
     if not row:
         raise RuntimeError(f"Paso no existe en Config_XimenaAI: {paso}")
 
-    row_vals = ws_config.row_values(row)  # 1 llamada
+    row_vals = ws_config.row_values(row)
 
     def get(col_name: str) -> str:
         idx = col_idx(cfg_headers, col_name)
@@ -290,6 +281,8 @@ def load_config_row(ws_config, paso: str, allow_fallback_inicio: bool = False):
         "Opciones_Validas": get("Opciones_Validas"),
         "Siguiente_Si_1": get("Siguiente_Si_1"),
         "Siguiente_Si_2": get("Siguiente_Si_2"),
+        "Siguiente_Si_3": get("Siguiente_Si_3"),
+        "Siguiente_Si_4": get("Siguiente_Si_4"),
         "Campo_BD_Leads_A_Actualizar": get("Campo_BD_Leads_A_Actualizar"),
         "Mensaje_Error": get("Mensaje_Error"),
     }
@@ -352,32 +345,22 @@ def whatsapp_webhook():
     if not msg_in:
         return safe_reply("Hola 👋 ¿En qué puedo ayudarte?")
 
-    # Cargar config del paso actual (aquí SÍ permitimos fallback a INICIO por seguridad)
+    # paso actual: aquí sí permitimos fallback a INICIO
     try:
         cfg = load_config_row(ws_config, estatus_actual, allow_fallback_inicio=True)
-    except Exception as e:
-        out = f"⚠️ Configuración faltante para el paso actual: {estatus_actual}"
-        safe_log(ws_logs, {
-            "ID_Log": str(uuid.uuid4()),
-            "Fecha_Hora": now_iso(),
-            "Telefono": tel_raw,
-            "ID_Lead": lead_id,
-            "Paso": estatus_actual,
-            "Mensaje_Entrante": msg_in,
-            "Mensaje_Saliente": out,
-            "Canal": canal,
-            "Fuente_Lead": fuente,
-            "Modelo_AI": modelo_ai,
-            "Errores": str(e),
-        })
-        return safe_reply(out)
+    except Exception:
+        return safe_reply(f"⚠️ Falta configurar el paso actual: {estatus_actual} en Config_XimenaAI.")
 
     paso_actual = cfg.get("ID_Paso") or (estatus_actual or "INICIO")
     tipo = (cfg.get("Tipo_Entrada") or "").upper().strip()
     texto_bot = cfg.get("Texto_Bot") or ""
     opciones_validas = [normalize_option(x) for x in (cfg.get("Opciones_Validas") or "").split(",") if x.strip()]
+
     sig1 = (cfg.get("Siguiente_Si_1") or "").strip()
     sig2 = (cfg.get("Siguiente_Si_2") or "").strip()
+    sig3 = (cfg.get("Siguiente_Si_3") or "").strip()
+    sig4 = (cfg.get("Siguiente_Si_4") or "").strip()
+
     campo_update = (cfg.get("Campo_BD_Leads_A_Actualizar") or "").strip()
     msg_error = (cfg.get("Mensaje_Error") or "Por favor responde con una opción válida.").strip()
 
@@ -385,7 +368,7 @@ def whatsapp_webhook():
     out = "Continuemos."
     next_paso = paso_actual
 
-    # DISPARO inicial: solo si es lead nuevo o realmente está en INICIO
+    # Disparo INICIO: SOLO si lead nuevo o está en INICIO
     if created or paso_actual == "INICIO":
         next_paso = sig1 or "INICIO"
         out = texto_bot or "Hola 👋"
@@ -413,13 +396,13 @@ def whatsapp_webhook():
         })
         return safe_reply(out)
 
-    # ---- ya no es INICIO: aplica lógica
+    # Lógica por tipo
     if tipo == "OPCIONES":
         if opciones_validas and msg_opt not in opciones_validas:
             out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
             next_paso = paso_actual
         else:
-            # guardar campo
+            # Guardar campo si aplica
             if campo_update:
                 field_real = resolve_leads_field(leads_headers, campo_update)
                 if col_idx(leads_headers, field_real):
@@ -430,20 +413,25 @@ def whatsapp_webhook():
                 else:
                     errores += f"Campo no existe en BD_Leads: {campo_update}. "
 
-            # decidir siguiente
-            if len(opciones_validas) >= 1 and msg_opt == opciones_validas[0]:
+            # Decidir siguiente (1..4)
+            if msg_opt == "1":
                 next_paso = sig1 or paso_actual
-            else:
+            elif msg_opt == "2":
                 next_paso = sig2 or paso_actual
+            elif msg_opt == "3":
+                next_paso = sig3 or paso_actual
+            elif msg_opt == "4":
+                next_paso = sig4 or paso_actual
+            else:
+                next_paso = paso_actual
 
-            # 🚫 AQUÍ YA NO HAY FALLBACK A INICIO
-            # Si el siguiente paso no existe, NO avanzamos y avisamos
+            # Cargar siguiente: SIN fallback a INICIO
             try:
                 cfg2 = load_config_row(ws_config, next_paso, allow_fallback_inicio=False)
                 out = cfg2.get("Texto_Bot") or "Continuemos."
             except Exception:
                 out = f"⚠️ Falta configurar el paso: {next_paso} en Config_XimenaAI."
-                next_paso = paso_actual  # no avanzamos (evita bucle)
+                next_paso = paso_actual  # no avanzar
 
     elif tipo == "SISTEMA":
         out = texto_bot or "Listo."
@@ -469,7 +457,7 @@ def whatsapp_webhook():
             out = f"⚠️ Falta configurar el paso: {next_paso} en Config_XimenaAI."
             next_paso = paso_actual
 
-    # update final
+    # Update final
     try:
         update_lead_batch(ws_leads, leads_headers, lead_row, {
             "Ultima_Actualizacion": now_iso(),
