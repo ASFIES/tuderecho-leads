@@ -12,7 +12,6 @@ from twilio.twiml.messaging_response import MessagingResponse
 import gspread
 from google.oauth2.service_account import Credentials
 
-
 # =========================
 # App
 # =========================
@@ -30,7 +29,6 @@ TAB_LOGS = os.environ.get("TAB_LOGS", "Logs").strip()
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
 GOOGLE_CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "").strip()
 
-
 # =========================
 # Time + Twilio
 # =========================
@@ -45,32 +43,29 @@ def safe_reply(text: str):
 
 
 # =========================
-# Normalización robusta
+# Normalización
 # =========================
-def normalize_phone(raw: str) -> str:
-    raw = (raw or "").strip()
-    raw = raw.replace("whatsapp:", "").strip()
-    return raw
+def phone_raw(raw: str) -> str:
+    # Conserva exactamente lo que manda Twilio: "whatsapp:+52..."
+    return (raw or "").strip()
+
+
+def phone_norm(raw: str) -> str:
+    # Canoniza a "+52..." para matching secundario
+    s = (raw or "").strip()
+    s = s.replace("whatsapp:", "").strip()
+    return s
 
 
 def normalize_msg(s: str) -> str:
     s = (s or "").strip()
-    # Normaliza unicode (quita rarezas como variantes de dígitos)
     s = unicodedata.normalize("NFKC", s)
-    # Quita caracteres de control invisibles
     s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
-    # Compacta espacios
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def normalize_option(s: str) -> str:
-    """
-    Para flujos de OPCIONES:
-    - " 1 " -> "1"
-    - "1️⃣" -> "1" (tras NFKC, suele quedar 1, si no, extraemos dígito)
-    - "1)" "1." "Opción 1" -> "1"
-    """
     s = normalize_msg(s)
     m = re.search(r"\d", s)
     if m:
@@ -82,12 +77,6 @@ def normalize_option(s: str) -> str:
 # Google creds + gspread
 # =========================
 def get_env_creds_dict():
-    """
-    Soporta:
-    - GOOGLE_CREDENTIALS_JSON = JSON literal (empieza con '{')
-    - GOOGLE_CREDENTIALS_JSON = base64 del JSON
-    - GOOGLE_CREDENTIALS_PATH = path a archivo JSON (local)
-    """
     if GOOGLE_CREDENTIALS_JSON:
         raw = GOOGLE_CREDENTIALS_JSON
         try:
@@ -134,56 +123,60 @@ def open_worksheet(sh, title: str):
 
 
 # =========================
-# Headers + lectura en bloque por fila
+# Headers (robusto a mayúsculas/minúsculas)
 # =========================
 def norm_header(s: str) -> str:
     return (s or "").strip()
 
 
 def build_header_map(ws):
-    headers = ws.row_values(1)  # 1 llamada
+    headers = ws.row_values(1)
     m = {}
     for i, h in enumerate(headers, start=1):
         key = norm_header(h)
-        if key and key not in m:
+        if not key:
+            continue
+        # mapa exacto
+        if key not in m:
             m[key] = i
+        # mapa case-insensitive (lower)
+        low = key.lower()
+        if low not in m:
+            m[low] = i
     return m
 
 
-def row_to_dict(row_vals: list, header_map: dict) -> dict:
-    """
-    Convierte una fila (lista) a dict por headers.
-    No hace llamadas a Sheets.
-    """
+def col_idx(headers_map: dict, name: str):
+    # Permite buscar por "ESTATUS" o "estatus" etc.
+    return headers_map.get(name) or headers_map.get((name or "").lower())
+
+
+def row_to_dict(row_vals: list, header_map: dict, canonical_headers: list):
     out = {}
-    for h, col_idx in header_map.items():
-        pos = col_idx - 1
-        out[h] = (row_vals[pos] if pos < len(row_vals) else "") or ""
-        out[h] = out[h].strip() if isinstance(out[h], str) else out[h]
+    for h in canonical_headers:
+        idx = col_idx(header_map, h)
+        if not idx:
+            out[h] = ""
+            continue
+        pos = idx - 1
+        v = (row_vals[pos] if pos < len(row_vals) else "") or ""
+        out[h] = v.strip() if isinstance(v, str) else v
     return out
 
 
-def get_row_dict(ws, header_map: dict, row_idx: int) -> dict:
-    """
-    Lee UNA fila completa con 1 sola llamada.
-    """
-    vals = ws.row_values(row_idx)  # 1 llamada
-    return row_to_dict(vals, header_map)
+def get_row_vals(ws, row_idx: int):
+    return ws.row_values(row_idx)
 
 
 # =========================
-# Búsquedas (1 llamada por columna)
+# Búsqueda por columna
 # =========================
-def find_row_by_value(ws, col_idx: int, value: str):
-    """
-    Busca value exacto en columna col_idx.
-    1 sola llamada: ws.col_values(col_idx)
-    """
+def find_row_by_value(ws, col_idx_num: int, value: str):
     value = (value or "").strip()
     if not value:
         return None
     try:
-        col_values = ws.col_values(col_idx)  # 1 llamada
+        col_values = ws.col_values(col_idx_num)
         for i, v in enumerate(col_values[1:], start=2):
             if (v or "").strip() == value:
                 return i
@@ -193,29 +186,26 @@ def find_row_by_value(ws, col_idx: int, value: str):
 
 
 # =========================
-# Escritura "casi atómica": batch_update (1 request)
+# Batch update (1 request)
 # =========================
-def update_lead_batch(ws, header_map: dict, row_idx: int, updates: dict):
-    """
-    Envía todas las actualizaciones en un solo request batch_update.
-    Esto reduce cuota y minimiza inconsistencia por fallos a mitad.
-    """
-    payload = []
-    for col, val in (updates or {}).items():
-        col_idx = header_map.get(col)
-        if not col_idx:
-            continue
-        a1 = gspread.utils.rowcol_to_a1(row_idx, col_idx)
-        payload.append({"range": a1, "values": [[val]]})
-
+def update_cells_batch(ws, updates_a1_to_value: dict):
+    payload = [{"range": a1, "values": [[val]]} for a1, val in updates_a1_to_value.items()]
     if payload:
         ws.batch_update(payload)
 
 
+def update_lead_batch(ws, header_map: dict, row_idx: int, updates: dict):
+    to_send = {}
+    for col_name, val in (updates or {}).items():
+        idx = col_idx(header_map, col_name)
+        if not idx:
+            continue
+        a1 = gspread.utils.rowcol_to_a1(row_idx, idx)
+        to_send[a1] = val
+    update_cells_batch(ws, to_send)
+
+
 def safe_log(ws_logs, data: dict):
-    """
-    Inserta un log. Si falla, no rompe el bot.
-    """
     try:
         cols = [
             "ID_Log", "Fecha_Hora", "Telefono", "ID_Lead", "Paso",
@@ -229,37 +219,45 @@ def safe_log(ws_logs, data: dict):
 
 
 # =========================
-# Leads: get/create con lecturas mínimas
+# Leads: busca por Teléfono RAW y por Normalizado
 # =========================
-def get_or_create_lead(ws_leads, leads_headers: dict, telefono: str, fuente: str = "FACEBOOK"):
-    """
-    Encuentra lead por teléfono; si no existe, crea uno.
-    Devuelve (row_index, lead_id, estatus_actual, created_bool, lead_row_dict).
-    """
-    tel_col = leads_headers.get("Telefono")
+def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_norm: str, fuente: str = "FACEBOOK"):
+    tel_col = col_idx(leads_headers, "Telefono")
     if not tel_col:
         raise RuntimeError("En BD_Leads falta la columna 'Telefono' en el header (fila 1).")
 
-    row = find_row_by_value(ws_leads, tel_col, telefono)
+    # 1) intenta encontrar por RAW (whatsapp:+52...)
+    row = find_row_by_value(ws_leads, tel_col, tel_raw)
+
+    # 2) si no, intenta por NORMALIZADO (+52...)
+    if not row:
+        row = find_row_by_value(ws_leads, tel_col, tel_norm)
 
     if row:
-        lead_row_dict = get_row_dict(ws_leads, leads_headers, row)  # 1 llamada
-        lead_id = (lead_row_dict.get("ID_Lead") or "").strip()
-        estatus = (lead_row_dict.get("ESTATUS") or "").strip()
-        return row, lead_id, estatus, False, lead_row_dict
+        vals = get_row_vals(ws_leads, row)
+        lead_id = ""
+        estatus = ""
+        idx_id = col_idx(leads_headers, "ID_Lead")
+        idx_est = col_idx(leads_headers, "ESTATUS")
+        if idx_id and idx_id - 1 < len(vals):
+            lead_id = (vals[idx_id - 1] or "").strip()
+        if idx_est and idx_est - 1 < len(vals):
+            estatus = (vals[idx_est - 1] or "").strip()
+        return row, lead_id, estatus, False
 
     # Crear lead nuevo
     lead_id = str(uuid.uuid4())
-    headers_row = ws_leads.row_values(1)  # 1 llamada
+    headers_row = ws_leads.row_values(1)
     new_row = [""] * max(1, len(headers_row))
 
     def set_if(col_name, val):
-        idx = leads_headers.get(col_name)
+        idx = col_idx(leads_headers, col_name)
         if idx and idx <= len(new_row):
             new_row[idx - 1] = val
 
     set_if("ID_Lead", lead_id)
-    set_if("Telefono", telefono)
+    set_if("Telefono", tel_raw)  # <-- GUARDA RAW para evitar bucles
+    set_if("Telefono_Normalizado", tel_norm)  # opcional si existe esa columna
     set_if("Fuente_Lead", fuente or "FACEBOOK")
     set_if("Fecha_Registro", now_iso())
     set_if("Ultima_Actualizacion", now_iso())
@@ -267,46 +265,40 @@ def get_or_create_lead(ws_leads, leads_headers: dict, telefono: str, fuente: str
 
     ws_leads.append_row(new_row, value_input_option="USER_ENTERED")
 
-    # recuperar row recién creado (1 llamada col_values)
-    row = find_row_by_value(ws_leads, tel_col, telefono)
-    lead_row_dict = {"ID_Lead": lead_id, "ESTATUS": "INICIO", "Telefono": telefono}
-    return row, lead_id, "INICIO", True, lead_row_dict
+    # recuperar row
+    row = find_row_by_value(ws_leads, tel_col, tel_raw) or find_row_by_value(ws_leads, tel_col, tel_norm)
+    return row, lead_id, "INICIO", True
 
 
 # =========================
-# Config: carga fila con 1 sola lectura
+# Config (fila con 1 lectura)
 # =========================
 def load_config_row(ws_config, paso_actual: str):
-    cfg_headers = build_header_map(ws_config)  # 1 llamada
-
-    if "ID_Paso" not in cfg_headers:
+    cfg_headers = build_header_map(ws_config)
+    idpaso_col = col_idx(cfg_headers, "ID_Paso")
+    if not idpaso_col:
         raise RuntimeError("En Config_XimenaAI falta la columna 'ID_Paso' en el header (fila 1).")
 
     paso_actual = (paso_actual or "").strip() or "INICIO"
 
-    row = find_row_by_value(ws_config, cfg_headers["ID_Paso"], paso_actual)  # 1 llamada
+    row = find_row_by_value(ws_config, idpaso_col, paso_actual)
     if not row and paso_actual != "INICIO":
-        row = find_row_by_value(ws_config, cfg_headers["ID_Paso"], "INICIO")  # 1 llamada
+        row = find_row_by_value(ws_config, idpaso_col, "INICIO")
 
     if not row:
         raise RuntimeError(f"No existe configuración para el paso '{paso_actual}' (ni para 'INICIO').")
 
-    # 1 sola lectura: toda la fila
-    row_vals = ws_config.row_values(row)  # 1 llamada
-    cfg = row_to_dict(row_vals, cfg_headers)
+    row_vals = ws_config.row_values(row)
+    fields = [
+        "ID_Paso", "Texto_Bot", "Tipo_Entrada", "Opciones_Validas",
+        "Siguiente_Si_1", "Siguiente_Si_2",
+        "Campo_BD_Leads_A_Actualizar", "Regla_Validacion", "Mensaje_Error"
+    ]
+    d = row_to_dict(row_vals, cfg_headers, fields)
 
-    # Campos esperados
     return {
         "row": row,
-        "ID_Paso": (cfg.get("ID_Paso") or "").strip(),
-        "Texto_Bot": (cfg.get("Texto_Bot") or "").strip(),
-        "Tipo_Entrada": (cfg.get("Tipo_Entrada") or "").strip(),
-        "Opciones_Validas": (cfg.get("Opciones_Validas") or "").strip(),
-        "Siguiente_Si_1": (cfg.get("Siguiente_Si_1") or "").strip(),
-        "Siguiente_Si_2": (cfg.get("Siguiente_Si_2") or "").strip(),
-        "Campo_BD_Leads_A_Actualizar": (cfg.get("Campo_BD_Leads_A_Actualizar") or "").strip(),
-        "Regla_Validacion": (cfg.get("Regla_Validacion") or "").strip(),
-        "Mensaje_Error": (cfg.get("Mensaje_Error") or "").strip(),
+        **{k: (d.get(k) or "").strip() for k in fields}
     }
 
 
@@ -320,23 +312,20 @@ def health():
 
 @app.post("/whatsapp")
 def whatsapp_webhook():
-    # Entradas Twilio
-    from_phone_raw = (request.form.get("From") or "").strip()
-    body_raw = (request.form.get("Body") or "")
+    from_phone_raw = phone_raw(request.form.get("From") or "")
+    from_phone_norm = phone_norm(from_phone_raw)
 
-    # Normalización
-    from_phone = normalize_phone(from_phone_raw)
+    body_raw = request.form.get("Body") or ""
     msg_in = normalize_msg(body_raw)
-    msg_opt = normalize_option(body_raw)  # para OPCIONES
+    msg_opt = normalize_option(body_raw)
 
-    # Defaults
     canal = "WHATSAPP"
     fuente = "FACEBOOK"
     modelo_ai = ""
 
     default_error_msg = "⚠️ Servicio activo, pero no puedo abrir Google Sheets. Revisa credenciales."
 
-    # 1) Abrir Sheets
+    # Sheets
     try:
         gc = get_gspread_client()
         sh = open_spreadsheet(gc)
@@ -346,19 +335,18 @@ def whatsapp_webhook():
     except Exception:
         return safe_reply(default_error_msg)
 
-    # 2) Headers (1 llamada)
     leads_headers = build_header_map(ws_leads)
 
-    # 3) Get/Create lead
+    # Lead
     try:
-        lead_row, lead_id, estatus_actual, created, lead_row_dict = get_or_create_lead(
-            ws_leads, leads_headers, from_phone, fuente
+        lead_row, lead_id, estatus_actual, created = get_or_create_lead(
+            ws_leads, leads_headers, from_phone_raw, from_phone_norm, fuente
         )
     except Exception as e:
         safe_log(ws_logs, {
             "ID_Log": str(uuid.uuid4()),
             "Fecha_Hora": now_iso(),
-            "Telefono": from_phone,
+            "Telefono": from_phone_raw,
             "ID_Lead": "",
             "Paso": "",
             "Mensaje_Entrante": msg_in,
@@ -368,15 +356,14 @@ def whatsapp_webhook():
             "Modelo_AI": modelo_ai,
             "Errores": str(e),
         })
-        return safe_reply("⚠️ Error interno (Lead). Revisa la configuración de BD_Leads.")
+        return safe_reply("⚠️ Error interno (Lead). Revisa BD_Leads.")
 
-    # 4) Si viene vacío
     if not msg_in:
         out = "Hola 👋 ¿En qué puedo ayudarte?"
         safe_log(ws_logs, {
             "ID_Log": str(uuid.uuid4()),
             "Fecha_Hora": now_iso(),
-            "Telefono": from_phone,
+            "Telefono": from_phone_raw,
             "ID_Lead": lead_id,
             "Paso": estatus_actual,
             "Mensaje_Entrante": msg_in,
@@ -388,7 +375,7 @@ def whatsapp_webhook():
         })
         return safe_reply(out)
 
-    # 5) Cargar config del paso actual (minimiza lecturas)
+    # Config del paso actual
     try:
         cfg = load_config_row(ws_config, estatus_actual)
     except Exception as e:
@@ -396,7 +383,7 @@ def whatsapp_webhook():
         safe_log(ws_logs, {
             "ID_Log": str(uuid.uuid4()),
             "Fecha_Hora": now_iso(),
-            "Telefono": from_phone,
+            "Telefono": from_phone_raw,
             "ID_Lead": lead_id,
             "Paso": estatus_actual,
             "Mensaje_Entrante": msg_in,
@@ -412,10 +399,7 @@ def whatsapp_webhook():
     tipo = (cfg.get("Tipo_Entrada") or "").upper().strip()
     texto_bot = cfg.get("Texto_Bot") or ""
 
-    opciones_validas = [x.strip() for x in (cfg.get("Opciones_Validas") or "").split(",") if x.strip()]
-    # normalizamos opciones válidas por si vienen " 1, 2 "
-    opciones_validas = [normalize_option(x) for x in opciones_validas]
-
+    opciones_validas = [normalize_option(x) for x in (cfg.get("Opciones_Validas") or "").split(",") if x.strip()]
     sig1 = (cfg.get("Siguiente_Si_1") or "").strip()
     sig2 = (cfg.get("Siguiente_Si_2") or "").strip()
     campo_update = (cfg.get("Campo_BD_Leads_A_Actualizar") or "").strip()
@@ -423,30 +407,24 @@ def whatsapp_webhook():
 
     errores = ""
 
-    # =========================
-    # REGLA: disparo INICIO sin validar lo que escriba
-    # (evita loops raros al primer mensaje)
-    # =========================
+    # ✅ Disparo INICIO sin validar lo que escribió el usuario, pero AVANZA estatus
     if created or paso_actual == "INICIO" or (estatus_actual or "").strip() == "INICIO":
         next_paso = sig1 or "INICIO"
         out = texto_bot or "Hola 👋"
 
-        updates = {
-            "Ultima_Actualizacion": now_iso(),
-            "ESTATUS": next_paso,
-        }
-        if "Ultimo_Mensaje_Cliente" in leads_headers:
-            updates["Ultimo_Mensaje_Cliente"] = msg_in
-
         try:
-            update_lead_batch(ws_leads, leads_headers, lead_row, updates)
+            update_lead_batch(ws_leads, leads_headers, lead_row, {
+                "Ultima_Actualizacion": now_iso(),
+                "ESTATUS": next_paso,
+                "Ultimo_Mensaje_Cliente": msg_in,
+            })
         except Exception as e:
             errores = f"BatchUpdateLead(INICIO) {e}"
 
         safe_log(ws_logs, {
             "ID_Log": str(uuid.uuid4()),
             "Fecha_Hora": now_iso(),
-            "Telefono": from_phone,
+            "Telefono": from_phone_raw,
             "ID_Lead": lead_id,
             "Paso": next_paso,
             "Mensaje_Entrante": msg_in,
@@ -469,14 +447,12 @@ def whatsapp_webhook():
         next_paso = sig1 or paso_actual
 
     elif tipo == "OPCIONES":
-        # Validación con opción normalizada (robusto)
         if opciones_validas and msg_opt not in opciones_validas:
             out = (texto_bot + "\n\n" if texto_bot else "") + (msg_error or "Responde con una opción válida.")
             next_paso = paso_actual
         else:
-            # Guardar valor en campo si existe
             if campo_update:
-                if campo_update in leads_headers:
+                if col_idx(leads_headers, campo_update):
                     try:
                         update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_opt})
                     except Exception as e:
@@ -484,13 +460,11 @@ def whatsapp_webhook():
                 else:
                     errores += f"Campo no existe en BD_Leads: {campo_update}. "
 
-            # Determinar siguiente
             if len(opciones_validas) >= 1 and msg_opt == opciones_validas[0]:
                 next_paso = sig1 or paso_actual
             else:
                 next_paso = sig2 or paso_actual
 
-            # Responder con texto del siguiente paso
             try:
                 cfg2 = load_config_row(ws_config, next_paso)
                 out = cfg2.get("Texto_Bot") or "Continuemos."
@@ -499,9 +473,8 @@ def whatsapp_webhook():
                 out = "Continuemos."
 
     else:
-        # TEXTO libre (default)
         if campo_update:
-            if campo_update in leads_headers:
+            if col_idx(leads_headers, campo_update):
                 try:
                     update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_in})
                 except Exception as e:
@@ -517,28 +490,20 @@ def whatsapp_webhook():
             errores += f"LoadCfg2({next_paso}) {e}. "
             out = "Gracias. Continuemos."
 
-    # =========================
-    # Batch update final (estatus + timestamp + último mensaje)
-    # =========================
-    final_updates = {
-        "Ultima_Actualizacion": now_iso(),
-        "ESTATUS": next_paso,
-    }
-    if "Ultimo_Mensaje_Cliente" in leads_headers:
-        final_updates["Ultimo_Mensaje_Cliente"] = msg_in
-
+    # Final update (estatus + timestamp + último mensaje)
     try:
-        update_lead_batch(ws_leads, leads_headers, lead_row, final_updates)
+        update_lead_batch(ws_leads, leads_headers, lead_row, {
+            "Ultima_Actualizacion": now_iso(),
+            "ESTATUS": next_paso,
+            "Ultimo_Mensaje_Cliente": msg_in,
+        })
     except Exception as e:
         errores += f" BatchUpdateLead(FINAL) {e}."
 
-    # =========================
-    # Log
-    # =========================
     safe_log(ws_logs, {
         "ID_Log": str(uuid.uuid4()),
         "Fecha_Hora": now_iso(),
-        "Telefono": from_phone,
+        "Telefono": from_phone_raw,
         "ID_Lead": lead_id,
         "Paso": next_paso,
         "Mensaje_Entrante": msg_in,
