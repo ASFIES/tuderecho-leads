@@ -57,6 +57,7 @@ def phone_norm(raw: str) -> str:
 def normalize_msg(s: str) -> str:
     s = (s or "").strip()
     s = unicodedata.normalize("NFKC", s)
+    # quita caracteres de control invisibles
     s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -143,7 +144,7 @@ def col_idx(headers_map: dict, name: str):
 
 
 # =========================
-# Buscar fila (1 llamada por columna)
+# Buscar fila por valor
 # =========================
 def find_row_by_value(ws, col_idx_num: int, value: str):
     value = (value or "").strip()
@@ -160,7 +161,7 @@ def find_row_by_value(ws, col_idx_num: int, value: str):
 
 
 # =========================
-# Batch update (1 request)
+# Batch update (menos llamadas, más consistencia)
 # =========================
 def update_lead_batch(ws, header_map: dict, row_idx: int, updates: dict):
     payload = []
@@ -214,18 +215,21 @@ def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_norm: st
     if not tel_col:
         raise RuntimeError("En BD_Leads falta la columna 'Telefono'.")
 
+    # busca por RAW (whatsapp:+...)
     row = find_row_by_value(ws_leads, tel_col, tel_raw)
+    # compatibilidad con registros viejos guardados como +52...
     if not row:
         row = find_row_by_value(ws_leads, tel_col, tel_norm)
 
     if row:
         idx_id = col_idx(leads_headers, "ID_Lead")
         idx_est = col_idx(leads_headers, "ESTATUS")
-        vals = ws_leads.row_values(row)
+        vals = ws_leads.row_values(row)  # 1 llamada
         lead_id = (vals[idx_id - 1] if idx_id and idx_id - 1 < len(vals) else "") or ""
         estatus = (vals[idx_est - 1] if idx_est and idx_est - 1 < len(vals) else "") or ""
         return row, lead_id.strip(), estatus.strip(), False
 
+    # crear nuevo
     lead_id = str(uuid.uuid4())
     header_row = ws_leads.row_values(1)
     new_row = [""] * max(1, len(header_row))
@@ -236,7 +240,7 @@ def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_norm: st
             new_row[idx - 1] = val
 
     set_if("ID_Lead", lead_id)
-    set_if("Telefono", tel_raw)
+    set_if("Telefono", tel_raw)  # importante: consistente
     set_if("Fuente_Lead", fuente or "FACEBOOK")
     set_if("Fecha_Registro", now_iso())
     set_if("Ultima_Actualizacion", now_iso())
@@ -249,7 +253,7 @@ def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_norm: st
 
 
 # =========================
-# Config: load sin fallback al cargar SIGUIENTE
+# Config: load controlado
 # =========================
 def load_config_row(ws_config, paso: str, allow_fallback_inicio: bool = False):
     cfg_headers = build_header_map(ws_config)
@@ -260,6 +264,7 @@ def load_config_row(ws_config, paso: str, allow_fallback_inicio: bool = False):
     paso = (paso or "").strip() or "INICIO"
     row = find_row_by_value(ws_config, idpaso_col, paso)
 
+    # fallback SOLO para recuperar un estatus inválido
     if not row and allow_fallback_inicio and paso != "INICIO":
         row = find_row_by_value(ws_config, idpaso_col, "INICIO")
 
@@ -345,7 +350,54 @@ def whatsapp_webhook():
     if not msg_in:
         return safe_reply("Hola 👋 ¿En qué puedo ayudarte?")
 
-    # paso actual: aquí sí permitimos fallback a INICIO
+    # =========================
+    # REINICIO MANUAL (palabras gatillo)
+    # =========================
+    reset_words = {"hola", "inicio", "menu", "menú", "empezar", "reiniciar", "reset"}
+    if msg_in.lower() in reset_words:
+        try:
+            update_lead_batch(ws_leads, leads_headers, lead_row, {
+                "Ultima_Actualizacion": now_iso(),
+                "ESTATUS": "INICIO",
+                "Ultimo_Mensaje_Cliente": msg_in,
+            })
+        except Exception:
+            pass
+
+        try:
+            cfg0 = load_config_row(ws_config, "INICIO", allow_fallback_inicio=False)
+            texto_inicio = cfg0.get("Texto_Bot") or "Hola 👋"
+            next_inicio = (cfg0.get("Siguiente_Si_1") or "").strip() or "INICIO"
+
+            # Guardar estatus siguiente para que el siguiente mensaje ya valide opciones
+            try:
+                update_lead_batch(ws_leads, leads_headers, lead_row, {
+                    "Ultima_Actualizacion": now_iso(),
+                    "ESTATUS": next_inicio,
+                })
+            except Exception:
+                pass
+
+            safe_log(ws_logs, {
+                "ID_Log": str(uuid.uuid4()),
+                "Fecha_Hora": now_iso(),
+                "Telefono": tel_raw,
+                "ID_Lead": lead_id,
+                "Paso": next_inicio,
+                "Mensaje_Entrante": msg_in,
+                "Mensaje_Saliente": texto_inicio,
+                "Canal": canal,
+                "Fuente_Lead": fuente,
+                "Modelo_AI": modelo_ai,
+                "Errores": "RESET_MANUAL",
+            })
+            return safe_reply(texto_inicio)
+        except Exception:
+            return safe_reply("Hola 👋")
+
+    # =========================
+    # Cargar config del paso actual
+    # =========================
     try:
         cfg = load_config_row(ws_config, estatus_actual, allow_fallback_inicio=True)
     except Exception:
@@ -368,7 +420,9 @@ def whatsapp_webhook():
     out = "Continuemos."
     next_paso = paso_actual
 
-    # Disparo INICIO: SOLO si lead nuevo o está en INICIO
+    # =========================
+    # Disparo INICIO solo en lead nuevo o estatus INICIO
+    # =========================
     if created or paso_actual == "INICIO":
         next_paso = sig1 or "INICIO"
         out = texto_bot or "Hola 👋"
@@ -396,7 +450,9 @@ def whatsapp_webhook():
         })
         return safe_reply(out)
 
+    # =========================
     # Lógica por tipo
+    # =========================
     if tipo == "OPCIONES":
         if opciones_validas and msg_opt not in opciones_validas:
             out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
@@ -425,7 +481,7 @@ def whatsapp_webhook():
             else:
                 next_paso = paso_actual
 
-            # Cargar siguiente: SIN fallback a INICIO
+            # Cargar siguiente sin fallback (evita bucles)
             try:
                 cfg2 = load_config_row(ws_config, next_paso, allow_fallback_inicio=False)
                 out = cfg2.get("Texto_Bot") or "Continuemos."
@@ -457,7 +513,9 @@ def whatsapp_webhook():
             out = f"⚠️ Falta configurar el paso: {next_paso} en Config_XimenaAI."
             next_paso = paso_actual
 
+    # =========================
     # Update final
+    # =========================
     try:
         update_lead_batch(ws_leads, leads_headers, lead_row, {
             "Ultima_Actualizacion": now_iso(),
@@ -487,3 +545,4 @@ def whatsapp_webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
