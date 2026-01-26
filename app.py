@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client
 
 import gspread
 from google.oauth2.service_account import Credentials
+import openai
 
 # =========================
 # App
@@ -34,6 +36,10 @@ GOOGLE_CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "").strip()
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_NUMBER = os.environ.get("TWILIO_NUMBER", "").strip() # whatsapp:+1...
 
 # =========================
 # Time + Twilio
@@ -290,7 +296,11 @@ def load_parametros(ws_param):
 # =========================
 # Abogados
 # =========================
-def pick_abogado(ws_abogados):
+def pick_abogado(ws_abogados, monto=0):
+    # Regla Iván: Si > 60,000 va siempre con Veronica (A01)
+    if monto > 60000:
+        return "A01", "Veronica Zavala", "+5215527773375"
+
     h = build_header_map(ws_abogados)
     idc = col_idx(h, "ID_Abogado")
     nc = col_idx(h, "Nombre_Abogado")
@@ -307,10 +317,10 @@ def pick_abogado(ws_abogados):
         at = (r[tc-1] if tc and tc-1 < len(r) else "").strip()
         if aid:
             return aid, an, at
-    return "A01", "Abogado", ""
+    return "A01", "Veronica Zavala", "+5215527773375"
 
 # =========================
-# Cálculo (compat con tu Parametros_Legales)
+# Cálculo (SDI Integrado)
 # =========================
 def calcular_estimacion(tipo_caso: str, salario_mensual: float, fecha_ini: str, fecha_fin: str, params: dict) -> float:
     try:
@@ -319,42 +329,40 @@ def calcular_estimacion(tipo_caso: str, salario_mensual: float, fecha_ini: str, 
         dias = max(0, (f_fin - f_ini).days)
         anios = dias / 365.0
 
+        # Cálculo con Salario Diario Integrado (SDI) - Factor mínimo 1.0452
         sd = salario_mensual / 30.0
+        sdi = sd * 1.0452
 
         indemn_dias = float(params.get("Indemnizacion", 90))
         prima_ant_dias = float(params.get("Prima_Antiguedad", 12))
         veinte_dias = float(params.get("Veinte_Dias_Por_Anio", 20))
 
-        total = (indemn_dias * sd) + (prima_ant_dias * sd * anios)
+        # Base: Indemnización 90 días + Prima Antigüedad
+        total = (indemn_dias * sdi) + (prima_ant_dias * sdi * anios)
 
-        # si fue "Me despidieron" (1) sumamos 20 días por año como estimación
+        # Si el usuario eligió opción 1 (Despido), se estiman 20 días por año
         if (tipo_caso or "").strip() == "1":
-            total += (veinte_dias * sd * anios)
+            total += (veinte_dias * sdi * anios)
 
         return round(total, 2)
     except:
         return 0.0
 
 # =========================
-# AUTO EJECUCIÓN SISTEMA (CLAVE)
+# AUTO EJECUCIÓN SISTEMA (OPENAI + ASIGNACIÓN)
 # =========================
 def run_system_step_if_needed(paso: str, lead_snapshot: dict, ws_leads, leads_headers, lead_row,
                               ws_abogados, ws_sys, ws_param) -> tuple[str, str, str]:
-    """
-    Si el paso es GENERAR_RESULTADOS, calcula + asigna + arma respuesta final.
-    Retorna: (next_paso, out_text, errores)
-    """
     errores = ""
-
     if paso != "GENERAR_RESULTADOS":
         return paso, "", errores
 
     sys_cfg = load_key_value(ws_sys)
     params = load_parametros(ws_param)
 
-    # leer datos necesarios
     try:
-        salario = float((lead_snapshot.get("Salario_Mensual") or "0").strip())
+        sal_raw = (lead_snapshot.get("Salario_Mensual") or "0").replace("$","").replace(",","").strip()
+        salario = float(sal_raw)
     except:
         salario = 0.0
 
@@ -366,41 +374,60 @@ def run_system_step_if_needed(paso: str, lead_snapshot: dict, ws_leads, leads_he
         params=params
     )
 
-    # resumen simple (por ahora sin GPT)
-    desc = (lead_snapshot.get("Descripcion_Situacion") or "").strip()
-    resumen = desc[:250] if desc else "Caso recibido. Un abogado revisará tu información."
+    # --- Lógica OpenAI ---
+    resumen_ai = "Caso recibido. Un experto revisará la información."
+    if OPENAI_API_KEY:
+        try:
+            client_ai = openai.OpenAI(api_key=OPENAI_API_KEY)
+            desc_user = lead_snapshot.get("Descripcion_Situacion") or "Sin detalles"
+            response = client_ai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "Eres Ximena AI. Resume el caso en 50 palabras máximo y da un consejo legal breve."},
+                    {"role": "user", "content": f"Situación: {desc_user}"}
+                ],
+                max_tokens=150
+            )
+            resumen_ai = response.choices[0].message.content.strip()
+        except Exception as e:
+            errores += f"AI_Err: {e}. "
 
-    abogado_id, abogado_nombre, abogado_tel = pick_abogado(ws_abogados)
+    abogado_id, abogado_nombre, abogado_tel = pick_abogado(ws_abogados, monto)
 
     token = uuid.uuid4().hex[:16]
-    base_url = (sys_cfg.get("BASE_URL_WEB") or "").strip()
     ruta_reporte = (sys_cfg.get("RUTA_REPORTE") or "").strip()
     link_reporte = (ruta_reporte.rstrip("/") + "/" + token) if ruta_reporte else ""
 
     out = (
-        f"✅ *Estimación preliminar*\n\n"
-        f"🧾 {resumen}\n\n"
-        f"💰 Monto estimado: *${monto:,.2f} MXN*\n"
-        f"👩‍⚖️ Abogado asignado: *{abogado_nombre}* ({abogado_id})\n\n"
-        f"📄 Informe: {link_reporte}\n"
-        f"ℹ️ {base_url}"
+        f"✅ *¡Análisis de Ximena AI listo!*\n\n"
+        f"⚖️ *Resumen:* {resumen_ai}\n\n"
+        f"💰 *Monto estimado:* ${monto:,.2f} MXN\n"
+        f"👩‍⚖️ *Abogado asignado:* {abogado_nombre}\n\n"
+        f"📄 *Ver informe completo:* {link_reporte}"
     ).strip()
 
-    # guardar en BD_Leads
     try:
         update_lead_batch(ws_leads, leads_headers, lead_row, {
-            "Analisis_AI": resumen,
+            "Analisis_AI": resumen_ai,
             "Resultado_Calculo": str(monto),
             "Abogado_Asignado_ID": abogado_id,
             "Abogado_Asignado_Nombre": abogado_nombre,
             "Token_Reporte": token,
             "Link_Reporte_Web": link_reporte,
-            "Es_Cliente": "SI",
+            "ESTATUS": "CLIENTE_MENU"
         })
+        
+        # --- Notificación proactiva al abogado (Si hay credenciales Twilio) ---
+        if TWILIO_SID and TWILIO_TOKEN:
+            tw_client = Client(TWILIO_SID, TWILIO_TOKEN)
+            tw_client.messages.create(
+                from_=TWILIO_NUMBER,
+                body=f"⚖️ Nuevo Lead: {lead_snapshot.get('Nombre')}\nMonto: ${monto}\nTel: {lead_snapshot.get('Telefono')}",
+                to=f"whatsapp:{abogado_tel}"
+            )
     except Exception as e:
-        errores += f"UpdateResultados {e}. "
+        errores += f"UpdateResultados_Err {e}. "
 
-    # siguiente paso del sistema principal
     return "CLIENTE_MENU", out, errores
 
 # =========================
@@ -423,9 +450,6 @@ def whatsapp_webhook():
     fuente = "DESCONOCIDA"
     modelo_ai = OPENAI_MODEL if OPENAI_API_KEY else ""
 
-    default_error_msg = "⚠️ Servicio activo, pero no puedo abrir Google Sheets. Revisa credenciales."
-
-    # Sheets
     try:
         gc = get_gspread_client()
         sh = open_spreadsheet(gc)
@@ -436,40 +460,20 @@ def whatsapp_webhook():
         ws_sys = open_worksheet(sh, TAB_SYS)
         ws_param = open_worksheet(sh, TAB_PARAM)
     except Exception:
-        return safe_reply(default_error_msg)
+        return safe_reply("⚠️ Error de conexión con la base de datos.")
 
     leads_headers = build_header_map(ws_leads)
-
-    # Lead
     lead_row, lead_id, estatus_actual, created = get_or_create_lead(
         ws_leads, leads_headers, from_phone_raw, from_phone_normed, fuente
     )
 
-    # leer snapshot del lead
     row_vals = ws_leads.row_values(lead_row)
     headers_list = ws_leads.row_values(1)
-    lead_snapshot = {}
-    for i, h in enumerate(headers_list):
-        lead_snapshot[h] = (row_vals[i] if i < len(row_vals) else "") or ""
+    lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
 
     if not msg_in:
-        out = "Hola 👋 ¿En qué puedo ayudarte?"
-        safe_log(ws_logs, {
-            "ID_Log": str(uuid.uuid4()),
-            "Fecha_Hora": now_iso(),
-            "Telefono": from_phone_raw,
-            "ID_Lead": lead_id,
-            "Paso": estatus_actual,
-            "Mensaje_Entrante": msg_in,
-            "Mensaje_Saliente": out,
-            "Canal": canal,
-            "Fuente_Lead": fuente,
-            "Modelo_AI": modelo_ai,
-            "Errores": "",
-        })
-        return safe_reply(out)
+        return safe_reply("Hola 👋")
 
-    # Config paso actual
     cfg = load_config_row(ws_config, estatus_actual)
     paso_actual = (cfg.get("ID_Paso") or estatus_actual or "INICIO").strip()
     tipo = (cfg.get("Tipo_Entrada") or "").upper().strip()
@@ -483,100 +487,54 @@ def whatsapp_webhook():
 
     errores = ""
 
-    # Disparo INICIO (primer mensaje)
     if created or paso_actual == "INICIO":
         next_paso = sig1 or "AVISO_PRIVACIDAD"
-        out = texto_bot or "Hola 👋"
-        update_lead_batch(ws_leads, leads_headers, lead_row, {
-            "Ultima_Actualizacion": now_iso(),
-            "Paso_Anterior": "INICIO",
-            "ESTATUS": next_paso,
-            "Ultimo_Mensaje_Cliente": msg_in,
-        })
-        safe_log(ws_logs, {
-            "ID_Log": str(uuid.uuid4()),
-            "Fecha_Hora": now_iso(),
-            "Telefono": from_phone_raw,
-            "ID_Lead": lead_id,
-            "Paso": next_paso,
-            "Mensaje_Entrante": msg_in,
-            "Mensaje_Saliente": out,
-            "Canal": canal,
-            "Fuente_Lead": fuente,
-            "Modelo_AI": modelo_ai,
-            "Errores": "",
-        })
+        out = texto_bot
+        update_lead_batch(ws_leads, leads_headers, lead_row, {"ESTATUS": next_paso, "Ultimo_Mensaje_Cliente": msg_in})
         return safe_reply(out)
 
-    # Lógica por tipo
     next_paso = paso_actual
-    out = texto_bot or "Continuemos."
+    out = texto_bot
 
     if tipo == "OPCIONES":
         if opciones_validas and msg_opt not in opciones_validas:
             out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
-            next_paso = paso_actual
         else:
-            if campo_update and col_idx(leads_headers, campo_update):
-                update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_opt})
-
+            if campo_update: update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_opt})
             next_paso = sig1 if (opciones_validas and msg_opt == opciones_validas[0]) else (sig2 or paso_actual)
-
-            # ✅ AQUÍ VIENE LA CLAVE: si el siguiente paso es SISTEMA, lo ejecutamos en la MISMA interacción
+            
+            # Encadenamiento SISTEMA
             cfg2 = load_config_row(ws_config, next_paso)
-            tipo2 = (cfg2.get("Tipo_Entrada") or "").upper().strip()
-
-            # refrescar snapshot antes de sistema
-            row_vals = ws_leads.row_values(lead_row)
-            headers_list = ws_leads.row_values(1)
-            lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
-
-            if tipo2 == "SISTEMA":
-                next_paso2, out_sys, err_sys = run_system_step_if_needed(
+            if (cfg2.get("Tipo_Entrada") or "").upper().strip() == "SISTEMA":
+                # Refrescar snapshot para el sistema
+                row_vals = ws_leads.row_values(lead_row)
+                lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
+                next_paso, out_sys, err_sys = run_system_step_if_needed(
                     next_paso, lead_snapshot, ws_leads, leads_headers, lead_row,
                     ws_abogados, ws_sys, ws_param
                 )
-                if out_sys:
-                    out = out_sys
-                    next_paso = next_paso2
-                else:
-                    out = render_text(cfg2.get("Texto_Bot") or out)
+                out = out_sys
                 errores += err_sys
             else:
                 out = render_text(cfg2.get("Texto_Bot") or out)
 
     elif tipo == "TEXTO":
-        if campo_update and col_idx(leads_headers, campo_update):
-            update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_in})
+        if campo_update: update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_in})
         next_paso = sig1 or paso_actual
         cfg2 = load_config_row(ws_config, next_paso)
-        out = render_text(cfg2.get("Texto_Bot") or "Gracias. Continuemos.")
+        out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
 
-    else:
-        # SISTEMA normal (si alguien cae aquí)
-        out = texto_bot or "Listo."
-        next_paso = sig1 or paso_actual
-
-    # Final update
     update_lead_batch(ws_leads, leads_headers, lead_row, {
         "Ultima_Actualizacion": now_iso(),
-        "Paso_Anterior": paso_actual,
         "ESTATUS": next_paso,
         "Ultimo_Mensaje_Cliente": msg_in,
     })
 
     safe_log(ws_logs, {
-        "ID_Log": str(uuid.uuid4()),
-        "Fecha_Hora": now_iso(),
-        "Telefono": from_phone_raw,
-        "ID_Lead": lead_id,
-        "Paso": next_paso,
-        "Mensaje_Entrante": msg_in,
-        "Mensaje_Saliente": out,
-        "Canal": canal,
-        "Fuente_Lead": fuente,
-        "Modelo_AI": modelo_ai,
-        "Errores": errores.strip(),
+        "ID_Log": str(uuid.uuid4()), "Fecha_Hora": now_iso(), "Telefono": from_phone_raw,
+        "ID_Lead": lead_id, "Paso": next_paso, "Mensaje_Entrante": msg_in,
+        "Mensaje_Saliente": out, "Canal": canal, "Fuente_Lead": fuente,
+        "Modelo_AI": modelo_ai, "Errores": errores.strip(),
     })
 
     return safe_reply(out)
