@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -109,6 +108,14 @@ def update_lead_batch(ws, header_map: dict, row_idx: int, updates: dict):
             payload.append({"range": gspread.utils.rowcol_to_a1(row_idx, idx), "values": [[val]]})
     if payload: ws.batch_update(payload)
 
+def safe_log(ws_logs, data: dict):
+    try:
+        row = [data.get("ID_Log",""), data.get("Fecha_Hora",""), data.get("Telefono",""), 
+               "", data.get("Paso",""), data.get("Mensaje_Entrante",""), 
+               data.get("Mensaje_Saliente",""), "WHATSAPP", "", "", ""]
+        ws_logs.append_row(row, value_input_option="USER_ENTERED")
+    except: pass
+
 # =========================
 # Logic & Flow
 # =========================
@@ -118,12 +125,12 @@ def get_or_create_lead(ws_leads, headers, tel_raw, tel_norm, fuente):
     
     if row:
         vals = ws_leads.row_values(row)
-        estatus = vals[col_idx(headers, "ESTATUS")-1] if col_idx(headers, "ESTATUS") <= len(vals) else "INICIO"
+        est_idx = col_idx(headers, "ESTATUS")
+        estatus = vals[est_idx-1] if est_idx and est_idx <= len(vals) else "INICIO"
         return row, estatus, False
     
-    # Crear nuevo Lead
     lead_id = str(uuid.uuid4())
-    new_row = [""] * 50 # Buffer
+    new_row = [""] * 50 
     def set_c(name, val):
         idx = col_idx(headers, name)
         if idx: new_row[idx-1] = val
@@ -139,21 +146,17 @@ def get_or_create_lead(ws_leads, headers, tel_raw, tel_norm, fuente):
     return find_row_by_value(ws_leads, idx_tel, tel_raw), "INICIO", True
 
 def load_config_row(ws_config, paso_actual):
-    paso_actual = paso_actual or "INICIO"
+    paso_actual = (paso_actual or "INICIO").strip()
     data = ws_config.get_all_records()
     for row in data:
         if str(row.get("ID_Paso", "")).strip() == paso_actual:
             return row
     return data[0] if data else {}
 
-def build_date_from_parts(y, m, d):
-    try: return datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d")
-    except: return ""
-
 # =========================
 # Webhook Route
 # =========================
-@app.post("/whatsapp")
+@app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
     from_phone = phone_raw(request.form.get("From") or "")
     from_norm = phone_norm(from_phone)
@@ -167,23 +170,21 @@ def whatsapp_webhook():
         sh = gc.open(GOOGLE_SHEET_NAME)
         ws_leads = sh.worksheet(TAB_LEADS)
         ws_config = sh.worksheet(TAB_CONFIG)
+        ws_logs = sh.worksheet(TAB_LOGS)
         headers = build_header_map(ws_leads)
         
         row_idx, estatus_actual, created = get_or_create_lead(ws_leads, headers, from_phone, from_norm, detect_fuente(msg_in))
         
-        # Obtener configuración del paso actual
         cfg = load_config_row(ws_config, estatus_actual)
         tipo = str(cfg.get("Tipo_Entrada", "")).upper()
-        
         next_paso = estatus_actual
-        
-        # Lógica de Navegación
+
+        # Lógica de Transición
         if tipo == "OPCIONES":
             opciones = [x.strip() for x in str(cfg.get("Opciones_Validas", "")).split(",")]
             if msg_opt in opciones:
                 campo = cfg.get("Campo_BD_Leads_A_Actualizar")
                 if campo: update_lead_batch(ws_leads, headers, row_idx, {campo: msg_opt})
-                # Determinar siguiente paso
                 next_paso = str(cfg.get(f"Siguiente_Si_{msg_opt}", cfg.get("Siguiente_Si_1", estatus_actual)))
             else:
                 return safe_reply(render_text(f"{cfg.get('Texto_Bot')}\n\n⚠️ {cfg.get('Mensaje_Error')}"))
@@ -193,36 +194,38 @@ def whatsapp_webhook():
             if campo: update_lead_batch(ws_leads, headers, row_idx, {campo: msg_in})
             next_paso = str(cfg.get("Siguiente_Si_1", estatus_actual))
 
-        # Saltos especiales (No pedir correo)
+        # Saltos lógicos (No pedir correo)
         if next_paso.upper() == "CORREO": next_paso = "DESCRIPCION"
 
-        # Manejo de Fechas (FIX)
-        if next_paso in ["INI_MES", "INI_DIA", "FIN_MES", "FIN_DIA", "SALARIO"]:
-            # Aquí podrías agregar validaciones de fecha si fuera necesario
-            pass
-
         # RELEVO AL WORKER
-        if next_paso == "GENERAR_RESULTADOS":
+        if next_paso == "GENERAR_RESULTADOS" or next_paso == "GENERAR_RESULTADO":
             update_lead_batch(ws_leads, headers, row_idx, {
                 "ESTATUS": "PROCESANDO",
                 "Procesar_AI_Status": "PENDIENTE",
                 "Ultima_Actualizacion": now_iso_mx()
             })
-            return safe_reply("⚖️ *Estamos analizando tu situación laboral...*\n\nNuestra inteligencia legal está revisando los datos para asignarte al mejor abogado y calcular tu estimación. Un momento, por favor.")
+            return safe_reply("⚖️ *Estamos analizando tu situación laboral...* Dame un momento, por favor.")
 
-        # Cargar texto del siguiente paso
+        # Cargar siguiente mensaje
         cfg_next = load_config_row(ws_config, next_paso)
+        bot_msg = cfg_next.get("Texto_Bot", "Continuemos...")
+
         update_lead_batch(ws_leads, headers, row_idx, {
             "ESTATUS": next_paso,
             "Ultima_Actualizacion": now_iso_mx(),
             "Ultimo_Mensaje_Cliente": msg_in
         })
 
-        return safe_reply(render_text(cfg_next.get("Texto_Bot", "Continuemos...")))
+        safe_log(ws_logs, {
+            "ID_Log": str(uuid.uuid4()), "Fecha_Hora": now_iso_mx(), "Telefono": from_phone,
+            "Paso": next_paso, "Mensaje_Entrante": msg_in, "Mensaje_Saliente": bot_msg
+        })
+
+        return safe_reply(render_text(bot_msg))
 
     except Exception as e:
         print(f"Error: {e}")
-        return safe_reply("⚠️ Lo siento, tuve un problema al conectar con mi base de datos. Intenta de nuevo.")
+        return safe_reply("⚠️ Tuvimos un problema técnico. Por favor escribe 'Hola' para reiniciar.")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
