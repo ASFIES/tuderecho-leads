@@ -349,13 +349,6 @@ def is_valid_by_rule(value: str, rule: str) -> bool:
         except:
             return False
 
-    if rule == "DATE_YYYY_MM_DD":
-        try:
-            datetime.strptime(value, "%Y-%m-%d")
-            return True
-        except:
-            return False
-
     if rule == "MONEY":
         try:
             x = float(value.replace("$", "").replace(",", "").strip())
@@ -376,9 +369,7 @@ def build_date_from_parts(y: str, m: str, d: str) -> str:
     if not (y and m and d):
         return ""
     try:
-        yy = int(y)
-        mm = int(m)
-        dd = int(d)
+        yy = int(y); mm = int(m); dd = int(d)
         dt = datetime(yy, mm, dd)
         return dt.strftime("%Y-%m-%d")
     except:
@@ -389,7 +380,6 @@ def build_date_from_parts(y: str, m: str, d: str) -> str:
 # Abogados
 # =========================
 def pick_abogado(ws_abogados, salario_mensual: float = 0.0):
-    # regla: salario mensual >= 50,000 -> A01
     if salario_mensual >= 50000:
         return "A01", "Veronica Zavala", "+5215527773375"
 
@@ -432,7 +422,6 @@ def calcular_estimacion(tipo_caso: str, salario_mensual: float, fecha_ini: str, 
 
         total = (indemn_dias * sdi) + (prima_ant_dias * sdi * anios)
 
-        # Si despido (opción 1)
         if (tipo_caso or "").strip() == "1":
             total += (veinte_dias * sdi * anios)
 
@@ -448,16 +437,15 @@ def build_result_message(nombre: str, resumen_ai: str, monto: float, abogado_nom
     nombre = (nombre or "").strip() or "Hola"
     return (
         f"✅ *{nombre}, gracias por confiar en nosotros.*\n\n"
-        f"Entiendo que este proceso puede ser pesado o confuso. "
-        f"Estoy aquí para acompañarte y ayudarte a dar el siguiente paso con claridad.\n\n"
+        f"Entiendo que este tipo de situaciones pueden ser difíciles. "
+        f"Te vamos a acompañar con claridad y respeto para proteger tus derechos.\n\n"
         f"🧾 *Resumen preliminar (informativo):*\n{resumen_ai}\n\n"
         f"💰 *Estimación inicial aproximada:* ${monto:,.2f} MXN\n"
         f"👩‍⚖️ *Abogada asignada:* {abogado_nombre}\n\n"
         f"📌 *Siguiente paso:* tu abogada revisará tu información y te contactará lo antes posible.\n\n"
         f"📄 *Informe completo:* {link_reporte}\n\n"
-        f"⚠️ *Aviso importante:* Esta información es únicamente orientativa y no constituye asesoría legal. "
-        f"No existe relación abogado-cliente hasta que un abogado acepte formalmente el asunto. "
-        f"Los montos pueden variar según prestaciones reales, salario integrado, pruebas y criterios aplicables."
+        f"⚠️ *Aviso importante:* Esta información es orientativa y no constituye asesoría legal. "
+        f"No existe relación abogado-cliente hasta que un abogado acepte formalmente el asunto."
     ).strip()
 
 
@@ -474,55 +462,36 @@ def run_system_step_if_needed(paso: str, lead_snapshot: dict, ws_leads, leads_he
     params = load_parametros(ws_param)
 
     nombre = lead_snapshot.get("Nombre") or ""
+    desc_user = lead_snapshot.get("Descripcion_Situacion") or "Sin detalles"
+    tipo_caso = (lead_snapshot.get("Tipo_Caso") or "").strip()
+    tipo_txt = "despido" if tipo_caso == "1" else "renuncia"
 
-    # salario
     try:
         sal_raw = (lead_snapshot.get("Salario_Mensual") or "0").replace("$", "").replace(",", "").strip()
         salario = float(sal_raw)
     except:
         salario = 0.0
 
-    # fechas
     fecha_ini = lead_snapshot.get("Fecha_Inicio_Laboral") or ""
     fecha_fin = lead_snapshot.get("Fecha_Fin_Laboral") or ""
 
-    monto = calcular_estimacion(
-        tipo_caso=lead_snapshot.get("Tipo_Caso") or "",
-        salario_mensual=salario,
-        fecha_ini=fecha_ini,
-        fecha_fin=fecha_fin,
-        params=params
-    )
-
-    # resumen fallback humano
-    desc_user = lead_snapshot.get("Descripcion_Situacion") or "Sin detalles"
-    tipo_caso = (lead_snapshot.get("Tipo_Caso") or "").strip()
-    tipo_txt = "despido" if tipo_caso == "1" else "renuncia"
+    monto = calcular_estimacion(tipo_caso, salario, fecha_ini, fecha_fin, params)
 
     resumen_ai = (
-        f"Gracias por compartirlo. Por lo que indicas, revisaremos tu caso como *{tipo_txt}* "
-        f"para identificar prestaciones pendientes (por ejemplo: partes proporcionales y pagos devengados) "
-        f"y si corresponde una indemnización o conceptos adicionales. "
-        f"Un abogado confirmará contigo los datos clave para proteger tus derechos."
+        f"Gracias por compartir tu situación. Con la información que nos diste, revisaremos tu caso como *{tipo_txt}* "
+        f"para identificar prestaciones pendientes (por ejemplo proporcionales y pagos devengados) y, si aplica, "
+        f"una indemnización u otros conceptos. Un abogado confirmará contigo los datos clave."
     )
 
-    # OpenAI (opcional) — si falla NO rompe nada
     if OPENAI_API_KEY:
         try:
             client_ai = OpenAI(api_key=OPENAI_API_KEY)
             resp = client_ai.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Eres Ximena AI, recepcionista de un despacho laboral en México. "
-                            "Redacta un resumen empático y claro (120 a 220 palabras). "
-                            "Incluye: (1) validación emocional breve, (2) enfoque informativo LFT sin prometer resultados, "
-                            "(3) qué revisará el abogado y siguientes pasos. No pidas correo."
-                        ),
-                    },
-                    {"role": "user", "content": f"Tipo: {tipo_txt}\nSituación: {desc_user}"},
+                    {"role": "system",
+                     "content": "Redacta un resumen empático y claro (120 a 220 palabras). No pidas correo."},
+                    {"role": "user", "content": f"Tipo: {tipo_txt}\nSituación: {desc_user}"}
                 ],
                 max_tokens=260,
             )
@@ -550,7 +519,6 @@ def run_system_step_if_needed(paso: str, lead_snapshot: dict, ws_leads, leads_he
             "Ultima_Actualizacion": now_iso_mx(),
         })
 
-        # Notificar abogado (si hay Twilio configurado)
         if TWILIO_SID and TWILIO_TOKEN and TWILIO_NUMBER and abogado_tel:
             tw_client = Client(TWILIO_SID, TWILIO_TOKEN)
             try:
@@ -615,7 +583,6 @@ def whatsapp_webhook():
 
     fuente = detect_fuente(msg_in)
 
-    # Conexión Sheets
     try:
         gc = get_gspread_client()
         sh = open_spreadsheet(gc)
@@ -630,19 +597,16 @@ def whatsapp_webhook():
 
     leads_headers = build_header_map(ws_leads)
 
-    # Crear/cargar lead
     lead_row, lead_id, estatus_actual, created = get_or_create_lead(
         ws_leads, leads_headers, from_phone_raw, from_phone_normed, fuente
     )
 
-    # Snapshot
     row_vals = ws_leads.row_values(lead_row)
     headers_list = ws_leads.row_values(1)
     lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
 
     errores = ""
 
-    # Si es nuevo: respondemos INICIO y NO avanzamos todavía
     if created:
         cfg_inicio = load_config_row(ws_config, "INICIO")
         out = render_text(cfg_inicio.get("Texto_Bot") or "Hola, soy Ximena AI 👋")
@@ -667,11 +631,10 @@ def whatsapp_webhook():
         })
         return safe_reply(out)
 
-    # Fail-safe: si por error cae en CORREO, lo saltamos
+    # Fail-safe: saltar CORREO si existiera
     if (estatus_actual or "").strip().upper() == "CORREO":
         estatus_actual = "DESCRIPCION"
 
-    # Cargar config del paso actual
     try:
         cfg = load_config_row(ws_config, estatus_actual)
     except Exception as e:
@@ -690,27 +653,23 @@ def whatsapp_webhook():
     next_paso = paso_actual
     out = texto_bot
 
-    # ======================================
+    # ======================
     # OPCIONES
-    # ======================================
+    # ======================
     if tipo == "OPCIONES":
         if opciones_validas and msg_opt not in opciones_validas:
             out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
             next_paso = paso_actual
         else:
-            # update si aplica (pero si por error el campo es Correo, lo ignoramos)
             if campo_update and campo_update.lower() != "correo":
                 update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_opt})
 
             next_paso = pick_next_step_from_option(cfg, msg_opt, paso_actual)
-
-            # Si por error el siguiente es CORREO, saltar
             if next_paso.upper() == "CORREO":
                 next_paso = "DESCRIPCION"
 
             cfg2 = load_config_row(ws_config, next_paso)
             if (cfg2.get("Tipo_Entrada") or "").upper().strip() == "SISTEMA":
-                # refrescar snapshot
                 row_vals = ws_leads.row_values(lead_row)
                 lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
                 next_paso, out_sys, err_sys = run_system_step_if_needed(
@@ -722,24 +681,23 @@ def whatsapp_webhook():
             else:
                 out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
 
-    # ======================================
+    # ======================
     # TEXTO
-    # ======================================
+    # ======================
     elif tipo == "TEXTO":
-        # validar
         if not is_valid_by_rule(msg_in, regla):
             out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
             next_paso = paso_actual
         else:
-            # guardar campo (pero nunca Correo)
+            # guardar campo (nunca correo)
             if campo_update and campo_update.lower() != "correo":
                 update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_in})
 
-            # refrescar snapshot para fechas
+            # refrescar snapshot
             row_vals = ws_leads.row_values(lead_row)
             lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
 
-            # si acabamos de capturar INI_DIA, armamos Fecha_Inicio_Laboral
+            # ----- FIX CRÍTICO: INI_DIA debe avanzar -----
             if paso_actual.upper() == "INI_DIA":
                 fecha_ini = build_date_from_parts(
                     lead_snapshot.get("Inicio_Anio"),
@@ -747,14 +705,14 @@ def whatsapp_webhook():
                     lead_snapshot.get("Inicio_Dia"),
                 )
                 if not fecha_ini:
-                    # Si la fecha no existe (ej. 31/02)
                     out = "Ups, esa fecha no parece válida. Por favor escribe nuevamente el *DÍA* (1 a 31)."
                     next_paso = "INI_DIA"
                 else:
                     update_lead_batch(ws_leads, leads_headers, lead_row, {"Fecha_Inicio_Laboral": fecha_ini})
+                    next_paso = "FIN_ANIO"  # ✅ FORZAR AVANCE
 
-            # si acabamos de capturar FIN_DIA, armamos Fecha_Fin_Laboral
-            if paso_actual.upper() == "FIN_DIA":
+            # ----- FIX CRÍTICO: FIN_DIA debe avanzar -----
+            elif paso_actual.upper() == "FIN_DIA":
                 fecha_fin = build_date_from_parts(
                     lead_snapshot.get("Fin_Anio"),
                     lead_snapshot.get("Fin_Mes"),
@@ -765,31 +723,32 @@ def whatsapp_webhook():
                     next_paso = "FIN_DIA"
                 else:
                     update_lead_batch(ws_leads, leads_headers, lead_row, {"Fecha_Fin_Laboral": fecha_fin})
+                    next_paso = "SALARIO"  # ✅ FORZAR AVANCE
 
-            # determinar siguiente
-            if next_paso not in ["INI_DIA", "FIN_DIA"]:  # si ya cambiamos next por error fecha
-                next_paso = (cfg.get("Siguiente_Si_1") or paso_actual).strip()
-
-            # Si por error el siguiente es CORREO, saltar
-            if next_paso.upper() == "CORREO":
-                next_paso = "DESCRIPCION"
-
-            cfg2 = load_config_row(ws_config, next_paso)
-            if (cfg2.get("Tipo_Entrada") or "").upper().strip() == "SISTEMA":
-                row_vals = ws_leads.row_values(lead_row)
-                lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
-                next_paso, out_sys, err_sys = run_system_step_if_needed(
-                    next_paso, lead_snapshot, ws_leads, leads_headers, lead_row,
-                    ws_abogados, ws_sys, ws_param
-                )
-                out = out_sys or "Listo."
-                errores += err_sys
+            # flujo normal para cualquier otro TEXTO
             else:
-                out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
+                next_paso = (cfg.get("Siguiente_Si_1") or paso_actual).strip()
+                if next_paso.upper() == "CORREO":
+                    next_paso = "DESCRIPCION"
 
-    # ======================================
+            # Si no estamos repitiendo el mismo paso, responder texto del siguiente paso
+            if next_paso != paso_actual:
+                cfg2 = load_config_row(ws_config, next_paso)
+                if (cfg2.get("Tipo_Entrada") or "").upper().strip() == "SISTEMA":
+                    row_vals = ws_leads.row_values(lead_row)
+                    lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
+                    next_paso, out_sys, err_sys = run_system_step_if_needed(
+                        next_paso, lead_snapshot, ws_leads, leads_headers, lead_row,
+                        ws_abogados, ws_sys, ws_param
+                    )
+                    out = out_sys or "Listo."
+                    errores += err_sys
+                else:
+                    out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
+
+    # ======================
     # SISTEMA
-    # ======================================
+    # ======================
     elif tipo == "SISTEMA":
         row_vals = ws_leads.row_values(lead_row)
         lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
@@ -800,7 +759,7 @@ def whatsapp_webhook():
         out = out_sys or "Listo."
         errores += err_sys
 
-    # Update lead base
+    # update lead base
     update_lead_batch(ws_leads, leads_headers, lead_row, {
         "Ultima_Actualizacion": now_iso_mx(),
         "ESTATUS": next_paso,
@@ -808,7 +767,7 @@ def whatsapp_webhook():
         "Fuente_Lead": lead_snapshot.get("Fuente_Lead") or fuente,
     })
 
-    # Log
+    # log
     safe_log(ws_logs, {
         "ID_Log": str(uuid.uuid4()),
         "Fecha_Hora": now_iso_mx(),
