@@ -1,61 +1,119 @@
 import os
+import time
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from utils.sheets import open_worksheet, find_row_by_value, update_row_dict
+from utils.sheets import (
+    open_spreadsheet,
+    open_worksheet,
+    find_row_by_value,
+    safe_update_cells,
+    get_all_records_cached,
+)
+from utils.whatsapp import send_whatsapp_message
 
+
+TZ = ZoneInfo("America/Mexico_City")
+
+GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
 TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
-TZ = os.environ.get("TZ", "America/Mexico_City")
+TAB_ABOGADOS = os.environ.get("TAB_ABOGADOS", "Cat_Abogados").strip()
+
+REPORT_BASE_URL = os.environ.get("REPORT_BASE_URL", "").strip()  # opcional
+
+
+def _now_iso():
+    return datetime.now(TZ).replace(microsecond=0).isoformat()
 
 
 def process_lead(lead_id: str):
     """
-    Job principal: termina cálculo + asignación y deja todo listo.
+    Job pesado:
+    - Lee lead
+    - Genera análisis/resultado preliminar
+    - Asigna abogada
+    - Guarda en Sheets
+    - Notifica por WhatsApp
     """
-    ws = open_worksheet(TAB_LEADS)
+    if not GOOGLE_SHEET_NAME:
+        raise RuntimeError("Falta GOOGLE_SHEET_NAME.")
 
-    row = find_row_by_value(ws, "ID_Lead", lead_id)
-    if not row:
-        return {"ok": False, "error": f"No encontré el lead {lead_id} en {TAB_LEADS}"}
+    sh = open_spreadsheet(GOOGLE_SHEET_NAME)
+    ws_leads = open_worksheet(sh, TAB_LEADS)
+    ws_abog = open_worksheet(sh, TAB_ABOGADOS)
 
-    # Aquí puedes leer solo lo mínimo necesario (evita muchas lecturas)
-    # OJO: get_all_records() lee todo; mejor leer fila completa:
-    values = ws.row_values(row)
-    headers = ws.row_values(1)
-    data = {headers[i]: (values[i] if i < len(values) else "") for i in range(len(headers))}
+    # ---------- Lee lead (1 lectura, con backoff adentro) ----------
+    row_idx = find_row_by_value(ws_leads, "ID_Lead", lead_id)
+    if not row_idx:
+        raise RuntimeError(f"No encontré lead {lead_id} en {TAB_LEADS}.")
 
-    tipo = str(data.get("Tipo_Caso", "")).strip()
-    desc = str(data.get("Descripcion_Situacion", "")).strip()
-    salario = str(data.get("Salario_Mensual", "")).strip()
-    ini = str(data.get("Fecha_Inicio_Laboral", "")).strip()
-    fin = str(data.get("Fecha_Fin_Laboral", "")).strip()
+    # Trae headers y fila completa (evita múltiples gets)
+    headers = ws_leads.row_values(1)
+    row_vals = ws_leads.row_values(row_idx)
+    lead = dict(zip(headers, row_vals))
 
-    # ---------- Resultado preliminar (puedes sofisticarlo luego) ----------
-    # Por ahora: genera texto de análisis y un “resultado_calculo” numérico placeholder
-    if tipo == "1":
-        caso_txt = "despido"
-    elif tipo == "2":
-        caso_txt = "renuncia"
-    else:
-        caso_txt = "caso laboral"
+    telefono = (lead.get("Telefono") or "").strip()
+    nombre = (lead.get("Nombre") or "").strip() or "Hola"
+    tipo_caso = (lead.get("Tipo_Caso") or "").strip()
+    descripcion = (lead.get("Descripcion_Situacion") or "").strip()
+    salario = (lead.get("Salario_Mensual") or "").strip()
+    ini = (lead.get("Fecha_Inicio_Laboral") or "").strip()
+    fin = (lead.get("Fecha_Fin_Laboral") or "").strip()
 
-    analisis_ai = (
-        f"Con la información que compartiste, revisaremos tu caso como '{caso_txt}' conforme a la LFT.\n"
-        f"Datos clave: inicio {ini}, fin {fin}, salario ${salario}.\n"
-        f"Descripción: {desc}\n\n"
-        "Este análisis es preliminar. Un abogado confirmará contigo los datos y el enfoque legal."
+    # ---------- Asignación simple round-robin (sin matar cuota) ----------
+    abogados = get_all_records_cached(ws_abog, ttl_seconds=30)
+    # Espera columnas típicas: Abogado_ID, Nombre_Abogado, Activo
+    activos = [a for a in abogados if str(a.get("Activo", "1")).strip() in ("1", "TRUE", "True", "SI", "Sí", "si")]
+    if not activos:
+        activos = abogados
+
+    # estrategia: hash del lead para repartir estable
+    pick = activos[hash(lead_id) % max(1, len(activos))]
+    abogado_id = (pick.get("Abogado_ID") or pick.get("ID") or "A01").strip()
+    abogado_nombre = (pick.get("Nombre_Abogado") or pick.get("Nombre") or "tu abogada").strip()
+
+    # ---------- Resultado preliminar (placeholder) ----------
+    # Aquí luego metemos cálculo real LFT.
+    resultado = f"Estimación preliminar generada (tipo: {tipo_caso})."
+
+    analisis = (
+        "Con la información que compartiste, revisaremos tu caso como "
+        f"“{tipo_caso}” conforme a la Ley Federal del Trabajo. "
+        "De forma preliminar, se consideran prestaciones devengadas "
+        "y, en su caso, indemnización. Un abogado confirmará contigo los datos "
+        "para cuidar tus derechos."
     )
 
-    # Puedes calcular luego; de momento deja 0.0 para no bloquear
-    resultado_calculo = "0.0"
+    token = uuid.uuid4().hex[:20]
+    link_reporte = ""
+    if REPORT_BASE_URL:
+        link_reporte = REPORT_BASE_URL.rstrip("/") + f"/r/{token}"
 
-    now = datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%dT%H:%M:%S%z")
-
-    update_row_dict(ws, row, {
-        "Analisis_AI": analisis_ai,
-        "Resultado_Calculo": resultado_calculo,
+    # ---------- Actualiza Sheets (1 batch) ----------
+    updates = {
+        "Ultima_Actualizacion": _now_iso(),
         "ESTATUS": "CLIENTE_MENU",
-        "Ultima_Actualizacion": now,
-    })
+        "Analisis_AI": analisis,
+        "Resultado_Calculo": resultado,
+        "Abogado_Asignado_ID": abogado_id,
+        "Abogado_Asignado_Nombre": abogado_nombre,
+        "Token_Reporte": token,
+        "Link_Reporte_Web": link_reporte,
+        "Ultimo_Error": "",
+    }
+    safe_update_cells(ws_leads, row_idx, updates)
 
-    return {"ok": True, "lead_id": lead_id, "estatus": "CLIENTE_MENU"}
+    # ---------- Mensaje al cliente ----------
+    msg = (
+        f"{nombre}, ya tengo tu estimación preliminar ✅\n\n"
+        f"Te asigné a: *{abogado_nombre}*.\n"
+        "En breve te contactamos para confirmar datos y proteger tus derechos.\n"
+    )
+    if link_reporte:
+        msg += f"\n📄 Tu reporte: {link_reporte}\n"
+
+    if telefono:
+        send_whatsapp_message(telefono, msg)
+
+    return {"ok": True, "lead_id": lead_id}

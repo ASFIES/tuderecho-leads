@@ -1,5 +1,4 @@
 import os
-import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,130 +8,217 @@ from twilio.twiml.messaging_response import MessagingResponse
 from redis import Redis
 from rq import Queue
 
-from utils.sheets import open_worksheet, find_row_by_value, update_row_dict, get_all_records_cached
-from worker_jobs import process_lead
+from utils.sheets import open_spreadsheet, open_worksheet, find_row_by_value, safe_update_cells, get_all_records_cached
+
+TZ = ZoneInfo("America/Mexico_City")
+
+GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
+TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
+TAB_CONFIG = os.environ.get("TAB_CONFIG", "Config_XimenaAI").strip()
+
+# ==========================================================
+#  SUNTUOSAMENTE AQUÍ VAN TUS 2 VARIABLES CLAVE DE REDIS 👑
+# ==========================================================
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()          # <-- LINK REDIS (rediss://...)
+REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()  # <-- NOMBRE COLA (ximena)
 
 app = Flask(__name__)
 
-TZ = os.environ.get("TZ", "America/Mexico_City")
+def _now_iso():
+    return datetime.now(TZ).replace(microsecond=0).isoformat()
 
-# Tabs
-TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
-TAB_FLOW = os.environ.get("TAB_FLOW", "Config_XimenaAI").strip()        # tu flujo (ID_Paso -> Texto_Bot)
-TAB_RULES = os.environ.get("TAB_RULES", "Config_Reglas").strip()        # reglas de validación/transición si la usas
-TAB_LOGS = os.environ.get("TAB_LOGS", "Logs").strip()
+def _norm_phone(from_field: str) -> str:
+    # Twilio trae: "whatsapp:+521..."
+    return (from_field or "").strip()
 
-# Redis / RQ
-REDIS_URL = os.environ.get("REDIS_URL", "redis://red-d5svi5v5r7bs73basen0:6379").strip()
-REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
+def _norm_body(body: str) -> str:
+    return (body or "").strip()
 
-if not REDIS_URL:
-    raise RuntimeError("Falta REDIS_URL en variables de entorno.")
-
-redis_conn = Redis.from_url(REDIS_URL)
-queue = Queue(REDIS_QUEUE_NAME, connection=redis_conn)
-
-
-def now_iso():
-    return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%dT%H:%M:%S%z")
-
-
-def get_or_create_lead(telefono: str) -> str:
-    ws = open_worksheet(TAB_LEADS)
-    # busca por Telefono
-    row = find_row_by_value(ws, "Telefono", telefono)
-    if row:
-        values = ws.row_values(row)
-        headers = ws.row_values(1)
-        data = {headers[i]: (values[i] if i < len(values) else "") for i in range(len(headers))}
-        lead_id = str(data.get("ID_Lead", "")).strip()
-        if lead_id:
-            return lead_id
-
-    # crear lead
-    lead_id = str(uuid.uuid4())[:8] + "-" + telefono[-4:]
-    # append básico (ideal: usar headers para armar)
-    ws.append_row([lead_id, telefono, telefono, "", "", "", "DESCONOCIDA", now_iso(), now_iso(), "INICIO"])
-    return lead_id
-
-
-def log_event(lead_id: str, telefono: str, paso: str, msg_in: str, msg_out: str):
-    try:
-        ws = open_worksheet(TAB_LOGS)
-        ws.append_row([now_iso(), telefono, lead_id, paso, msg_in, msg_out, "WHATSAPP", "DESCONOCIDA", "gpt-4o-mini", ""])
-    except Exception:
-        pass
-
-
-def get_flow_text(id_paso: str) -> str:
-    # cachea Config_XimenaAI en Redis para no leerlo siempre
-    rows = get_all_records_cached(TAB_FLOW, cache_key="flow")
+def _load_config_steps(ws_config):
+    """
+    Espera Config_XimenaAI con columnas:
+    ID_Paso | Texto_Bot | Opciones_Validas (opcional)
+    """
+    rows = get_all_records_cached(ws_config, ttl_seconds=15)
+    by_id = {}
     for r in rows:
-        if str(r.get("ID_Paso", "")).strip() == id_paso:
-            return str(r.get("Texto_Bot", "")).strip()
-    return ""
+        pid = str(r.get("ID_Paso", "")).strip()
+        if pid:
+            by_id[pid] = r
+    return by_id
+
+def _get_text(step_cfg, nombre=""):
+    txt = str(step_cfg.get("Texto_Bot", "")).strip()
+    if nombre:
+        txt = txt.replace("{Nombre}", nombre)
+    return txt
+
+def _get_valid_options(step_cfg):
+    opts = str(step_cfg.get("Opciones_Validas", "")).strip()
+    if not opts:
+        return None
+    return [o.strip() for o in opts.split(",") if o.strip()]
+
+def _next_step(current_step: str, user_msg: str) -> str:
+    """
+    Reglas mínimas para tu flujo actual:
+    INICIO -> AVISO_PRIVACIDAD
+    AVISO_PRIVACIDAD (1/2) -> CASO_TIPO o FIN_NO_ACEPTA
+    CASO_TIPO -> CONFIRMACION_DATOS
+    CONFIRMACION_DATOS -> NOMBRE ...
+    DISCLAIMER (1 continuar) -> EN_PROCESO
+    EN_PROCESO -> (se queda, worker lo pasa a CLIENTE_MENU)
+    """
+    m = user_msg.strip()
+
+    if current_step == "INICIO":
+        return "AVISO_PRIVACIDAD"
+
+    if current_step == "AVISO_PRIVACIDAD":
+        if m == "1":
+            return "CASO_TIPO"
+        if m == "2":
+            return "FIN_NO_ACEPTA"
+        return "AVISO_PRIVACIDAD"
+
+    if current_step == "CASO_TIPO":
+        if m in ("1", "2"):
+            return "CONFIRMACION_DATOS"
+        return "CASO_TIPO"
+
+    if current_step == "CONFIRMACION_DATOS":
+        if m in ("1", "2"):
+            return "NOMBRE" if m == "1" else "FIN_NO_CONTINUA"
+        return "CONFIRMACION_DATOS"
+
+    # el resto lo manejas por tu tabla; aquí lo dejamos lineal:
+    order = ["NOMBRE","APELLIDO","DESCRIPCION","INI_ANIO","INI_MES","INI_DIA","FIN_ANIO","FIN_MES","FIN_DIA","SALARIO","DISCLAIMER"]
+    if current_step in order:
+        i = order.index(current_step)
+        if i < len(order)-1:
+            return order[i+1]
+        return "DISCLAIMER"
+
+    if current_step == "DISCLAIMER":
+        if m == "1":
+            return "EN_PROCESO"
+        if m == "2":
+            return "FIN_NO_CONTINUA"
+        return "DISCLAIMER"
+
+    if current_step in ("EN_PROCESO","CLIENTE_MENU","FIN_NO_CONTINUA","FIN_NO_ACEPTA"):
+        return current_step
+
+    return "INICIO"
 
 
 @app.post("/whatsapp")
-def whatsapp():
-    incoming = request.values.get("Body", "").strip()
-    from_number = request.values.get("From", "").strip()  # ej: whatsapp:+52155...
-    telefono = from_number
-
-    lead_id = get_or_create_lead(telefono)
-
-    # Lee lead para saber estatus/paso actual
-    ws = open_worksheet(TAB_LEADS)
-    row = find_row_by_value(ws, "ID_Lead", lead_id)
-    values = ws.row_values(row)
-    headers = ws.row_values(1)
-    lead = {headers[i]: (values[i] if i < len(values) else "") for i in range(len(headers))}
-
-    paso_actual = (lead.get("ESTATUS") or "INICIO").strip()
-
-    # ---- EJEMPLO: si ya está en EN_PROCESO, no lo reproceses infinito
-    if paso_actual == "EN_PROCESO":
+def whatsapp_webhook():
+    if not GOOGLE_SHEET_NAME:
         resp = MessagingResponse()
-        msg_out = "Estoy preparando tu estimación preliminar. En un momento te envío el resultado por este medio."
-        resp.message(msg_out)
-        log_event(lead_id, telefono, paso_actual, incoming, msg_out)
+        resp.message("Error interno: falta GOOGLE_SHEET_NAME.")
         return str(resp)
 
-    # ---- Aquí normalmente harías tu lógica de transición por reglas
-    # Para que funcione ya: si el usuario llega a tu opción 1 después de DISCLAIMER -> EN_PROCESO
-    # En tu Sheet ya existe EN_PROCESO como paso.
-    # Si el usuario escribió "1" y el paso anterior era DISCLAIMER, pasamos a EN_PROCESO.
-    paso_siguiente = None
-    if paso_actual == "WAIT_RESULTADO" or paso_actual == "DISCLAIMER":
-        if incoming == "1":
-            paso_siguiente = "EN_PROCESO"
+    from_ = _norm_phone(request.form.get("From"))
+    body = _norm_body(request.form.get("Body"))
 
-    # fallback: mantener
-    if not paso_siguiente:
-        # si está en CLIENTE_MENU etc, responde con el texto configurado
-        paso_siguiente = paso_actual
+    sh = open_spreadsheet(GOOGLE_SHEET_NAME)
+    ws_leads = open_worksheet(sh, TAB_LEADS)
+    ws_cfg = open_worksheet(sh, TAB_CONFIG)
 
-    # Si llegamos a EN_PROCESO: encola job
-    if paso_siguiente == "EN_PROCESO":
-        update_row_dict(ws, row, {"ESTATUS": "EN_PROCESO", "Ultima_Actualizacion": now_iso()})
+    cfg = _load_config_steps(ws_cfg)
 
-        # ✅ ENQUEUE (lo importante)
-        queue.enqueue(process_lead, lead_id)
+    # -------- upsert lead por Telefono (o Telefono_Normalizado) --------
+    lead_row = find_row_by_value(ws_leads, "Telefono", from_)
+    if not lead_row:
+        # crea nuevo lead: aquí lo mínimo (asumiendo headers ya existen)
+        # Para simplificar sin añadir más lecturas: buscamos última fila y append
+        headers = ws_leads.row_values(1)
+        new = {h: "" for h in headers}
+        new["ID_Lead"] = from_.replace("whatsapp:", "").replace("+", "")
+        new["Telefono"] = from_
+        new["Fuente_Lead"] = "DESCONOCIDA"
+        new["Fecha_Registro"] = _now_iso()
+        new["Ultima_Actualizacion"] = _now_iso()
+        new["ESTATUS"] = "INICIO"
 
-        resp = MessagingResponse()
-        msg_out = "Estoy preparando tu estimación preliminar y asignando a la abogada que llevará tu caso.\nEn un momento te envío el resultado por este medio."
-        resp.message(msg_out)
-        log_event(lead_id, telefono, "EN_PROCESO", incoming, msg_out)
-        return str(resp)
+        ws_leads.append_row([new.get(h,"") for h in headers], value_input_option="USER_ENTERED")
+        lead_row = find_row_by_value(ws_leads, "Telefono", from_)
 
-    # Respuesta normal por texto configurado
-    texto = get_flow_text(paso_siguiente) or "Estoy en pruebas. Escribe 'Hola' para comenzar."
+    # Lee estatus actual
+    headers = ws_leads.row_values(1)
+    row_vals = ws_leads.row_values(lead_row)
+    lead = dict(zip(headers, row_vals))
+
+    current = (lead.get("ESTATUS") or "INICIO").strip() or "INICIO"
+    nombre = (lead.get("Nombre") or "").strip()
+
+    # -------- valida opciones si aplica --------
+    step_cfg = cfg.get(current, {})
+    valid = _get_valid_options(step_cfg)
+    if valid is not None:
+        if body not in valid:
+            r = MessagingResponse()
+            r.message("Por favor responde con una opción válida (ej. 1 o 2).")
+            return str(r)
+
+    # -------- guarda dato del paso (si corresponde a una columna) --------
+    # Mapeo simple; si ya lo tienes en Sheets por tabla, luego lo conectamos.
+    step_to_col = {
+        "NOMBRE": "Nombre",
+        "APELLIDO": "Apellido",
+        "DESCRIPCION": "Descripcion_Situacion",
+        "SALARIO": "Salario_Mensual",
+        # fecha la reconstruyes tú (aquí ejemplo rápido):
+        "INI_ANIO": "Inicio_Anio",
+        "INI_MES": "Inicio_Mes",
+        "INI_DIA": "Inicio_Dia",
+        "FIN_ANIO": "Fin_Anio",
+        "FIN_MES": "Fin_Mes",
+        "FIN_DIA": "Fin_Dia",
+        "CASO_TIPO": "Tipo_Caso",
+        "AVISO_PRIVACIDAD": "Aviso_Privacidad_Aceptado",
+    }
+
+    updates = {"Ultima_Actualizacion": _now_iso()}
+    col = step_to_col.get(current)
+    if col:
+        updates[col] = body
+
+    # next step
+    nxt = _next_step(current, body)
+    updates["ESTATUS"] = nxt
+
+    safe_update_cells(ws_leads, lead_row, updates)
+
+    # -------- responder al usuario --------
     resp = MessagingResponse()
-    resp.message(texto)
-    log_event(lead_id, telefono, paso_siguiente, incoming, texto)
+
+    # si pasamos a EN_PROCESO, encolamos job y damos mensaje bonito
+    if nxt == "EN_PROCESO":
+        # cola redis
+        if not REDIS_URL:
+            resp.message("Error interno: falta REDIS_URL.")
+            return str(resp)
+
+        lead_id = lead.get("ID_Lead") or from_.replace("whatsapp:", "")
+        redis_conn = Redis.from_url(REDIS_URL)
+        q = Queue(REDIS_QUEUE_NAME, connection=redis_conn)
+
+        from worker_jobs import process_lead
+        q.enqueue(process_lead, lead_id, job_timeout=180)
+
+        resp.message(
+            "Gracias, ya tengo lo necesario ✅\n\n"
+            "Estoy preparando tu estimación preliminar y asignando a la abogada que llevará tu caso.\n"
+            "En un momento te envío el resultado por este medio."
+        )
+        return str(resp)
+
+    # texto del siguiente paso
+    next_cfg = cfg.get(nxt, {})
+    msg = _get_text(next_cfg, nombre=nombre)
+    if not msg:
+        msg = "Perfecto. Continuemos."
+    resp.message(msg)
     return str(resp)
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}

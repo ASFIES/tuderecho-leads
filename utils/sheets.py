@@ -1,196 +1,148 @@
 import os
 import json
 import time
-import random
-from typing import Any, Dict, List, Optional, Tuple
+from functools import lru_cache
+from typing import Dict, Any, Optional, List
 
 import gspread
 from google.oauth2.service_account import Credentials
-
-# -------------------------
-# ENV
-# -------------------------
-GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-
-# Cache control
-CONFIG_CACHE_TTL_SECONDS = int(os.environ.get("CONFIG_CACHE_TTL_SECONDS", "180"))  # 2 minutos
-
-# Lazy globals
-_GC = None
-_SH = None
+from gspread.exceptions import APIError
 
 
-def _get_creds() -> Credentials:
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    if GOOGLE_CREDS_JSON:
-        info = json.loads(GOOGLE_CREDS_JSON)
-        return Credentials.from_service_account_info(info, scopes=scopes)
-
-    if GOOGLE_CREDS_PATH:
-        return Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
-
-    raise RuntimeError(
-        "Falta GOOGLE_CREDENTIALS_JSON o GOOGLE_APPLICATION_CREDENTIALS en variables de entorno."
-    )
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
-def get_gspread_client() -> gspread.Client:
-    global _GC
-    if _GC is None:
-        creds = _get_creds()
-        _GC = gspread.authorize(creds)
-    return _GC
+def _sleep_backoff(attempt: int):
+    # 0, 1, 2, 4, 8 segundos aprox
+    time.sleep(min(8, (2 ** max(0, attempt - 1))))
 
 
-def open_spreadsheet():
-    global _SH
-    if _SH is None:
-        if not GOOGLE_SHEET_NAME:
-            raise RuntimeError("Falta GOOGLE_SHEET_NAME en variables de entorno.")
-        gc = get_gspread_client()
-        _SH = gc.open(GOOGLE_SHEET_NAME)
-    return _SH
+def _is_quota_error(e: Exception) -> bool:
+    msg = str(e)
+    return "429" in msg or "Quota exceeded" in msg or "Read requests" in msg
 
 
-def open_worksheet(tab_name: str):
-    sh = open_spreadsheet()
-    return sh.worksheet(tab_name)
-
-
-# -------------------------
-# Redis cache (opcional)
-# -------------------------
-def _redis():
-    # Import local para no romper si no está instalado en local
-    try:
-        from redis import Redis
-    except Exception:
-        return None
-
-    redis_url = os.environ.get("REDIS_URL", "").strip()
-    if not redis_url:
-        return None
-    try:
-        return Redis.from_url(redis_url, decode_responses=True)
-    except Exception:
-        return None
-
-
-def _cache_get(key: str) -> Optional[str]:
-    r = _redis()
-    if not r:
-        return None
-    try:
-        return r.get(key)
-    except Exception:
-        return None
-
-
-def _cache_set(key: str, value: str, ttl: int):
-    r = _redis()
-    if not r:
-        return
-    try:
-        r.setex(key, ttl, value)
-    except Exception:
-        return
-
-
-# -------------------------
-# Backoff / Retry for 429
-# -------------------------
-def _with_backoff(fn, max_tries: int = 6):
+@lru_cache(maxsize=1)
+def get_gspread_client():
     """
-    Reintenta cuando Google corta por cuota (429) u otros errores temporales.
+    Usa credenciales desde:
+    - GOOGLE_CREDENTIALS_JSON (json completo)
+    - o GOOGLE_APPLICATION_CREDENTIALS (path)
     """
-    for i in range(max_tries):
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+
+    if creds_json:
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        return gspread.authorize(creds)
+
+    if creds_path:
+        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+        return gspread.authorize(creds)
+
+    raise RuntimeError("Faltan credenciales: GOOGLE_CREDENTIALS_JSON o GOOGLE_APPLICATION_CREDENTIALS.")
+
+
+def open_spreadsheet(sheet_name: str):
+    gc = get_gspread_client()
+    for attempt in range(1, 6):
         try:
-            return fn()
-        except Exception as e:
-            msg = str(e).lower()
-            is_quota = ("429" in msg) or ("quota" in msg) or ("read requests" in msg)
-            if not is_quota and i >= 1:
-                # si no parece cuota y ya falló una vez, no insistas
-                raise
-
-            sleep_s = (2 ** i) + random.random()
-            time.sleep(min(sleep_s, 20))
-    # si llegamos aquí, re-lanzamos el último intento
-    return fn()
+            return gc.open(sheet_name)
+        except APIError as e:
+            if _is_quota_error(e) and attempt < 6:
+                _sleep_backoff(attempt)
+                continue
+            raise
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def get_all_records_cached(tab_name: str, cache_key: str) -> List[Dict[str, Any]]:
-    """
-    Para Configs: cacheamos en Redis para no leer Sheets cada mensaje.
-    """
-    ck = f"cfg:{cache_key}:{tab_name}"
-    cached = _cache_get(ck)
-    if cached:
+def open_worksheet(sh, title: str):
+    for attempt in range(1, 6):
         try:
-            return json.loads(cached)
-        except Exception:
-            pass
-
-    ws = open_worksheet(tab_name)
-    records = _with_backoff(lambda: ws.get_all_records())
-    _cache_set(ck, json.dumps(records, ensure_ascii=False), CONFIG_CACHE_TTL_SECONDS)
-    return records
+            return sh.worksheet(title)
+        except APIError as e:
+            if _is_quota_error(e) and attempt < 6:
+                _sleep_backoff(attempt)
+                continue
+            raise
 
 
-def find_row_by_value(ws, col_name: str, value: str) -> Optional[int]:
+# -------------------------
+# Cache simple por worksheet
+# -------------------------
+_cache = {}  # key -> (expires_at, data)
+
+
+def get_all_records_cached(ws, ttl_seconds: int = 30) -> List[Dict[str, Any]]:
+    key = f"{ws.spreadsheet.id}:{ws.title}"
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+
+    for attempt in range(1, 6):
+        try:
+            data = ws.get_all_records()
+            _cache[key] = (now + ttl_seconds, data)
+            return data
+        except APIError as e:
+            if _is_quota_error(e) and attempt < 6:
+                _sleep_backoff(attempt)
+                continue
+            raise
+
+
+def find_row_by_value(ws, header_name: str, value: str) -> Optional[int]:
     """
-    Busca fila por valor exacto en una columna (usando cabeceras).
+    Busca la fila (index 2..n) donde header_name == value
+    Minimiza lecturas: obtiene headers + columna completa.
     """
-    headers = _with_backoff(lambda: ws.row_values(1))
-    if col_name not in headers:
-        raise RuntimeError(f"No existe la columna '{col_name}' en la hoja {ws.title}")
-    col_idx = headers.index(col_name) + 1
+    headers = ws.row_values(1)
+    if header_name not in headers:
+        return None
+    col = headers.index(header_name) + 1
 
-    def _get_col():
-        return ws.col_values(col_idx)
+    for attempt in range(1, 6):
+        try:
+            col_vals = ws.col_values(col)
+            break
+        except APIError as e:
+            if _is_quota_error(e) and attempt < 6:
+                _sleep_backoff(attempt)
+                continue
+            raise
 
-    col_vals = _with_backoff(_get_col)
-    for i, v in enumerate(col_vals[1:], start=2):  # desde fila 2
-        if str(v).strip() == str(value).strip():
+    target = str(value).strip()
+    for i, v in enumerate(col_vals, start=1):
+        if i == 1:
+            continue
+        if str(v).strip() == target:
             return i
     return None
 
 
-def update_row_dict(ws, row: int, updates: Dict[str, Any]):
+def safe_update_cells(ws, row_idx: int, updates: Dict[str, Any]):
     """
-    Actualiza varias columnas en una fila con un solo batch (reduce lecturas/escrituras).
+    Actualiza varias columnas en 1 batch (menos cuota).
+    updates: {"ColName": "valor"}
     """
-    headers = _with_backoff(lambda: ws.row_values(1))
+    headers = ws.row_values(1)
     cells = []
     for k, v in updates.items():
         if k not in headers:
-            # si no existe la columna, ignora (para no romper producción)
             continue
-        col_idx = headers.index(k) + 1
-        cells.append((row, col_idx, v))
+        col = headers.index(k) + 1
+        cells.append(gspread.Cell(row_idx, col, str(v)))
 
     if not cells:
         return
 
-    def _batch():
-        cell_list = ws.range(min(r for r, c, _ in cells),
-                             min(c for r, c, _ in cells),
-                             max(r for r, c, _ in cells),
-                             max(c for r, c, _ in cells))
-        # mapa para setear solo lo necesario
-        for cell in cell_list:
-            for rr, cc, vv in cells:
-                if cell.row == rr and cell.col == cc:
-                    cell.value = "" if vv is None else str(vv)
-        ws.update_cells(cell_list)
-
-    _with_backoff(_batch)
+    for attempt in range(1, 6):
+        try:
+            ws.update_cells(cells, value_input_option="USER_ENTERED")
+            return
+        except APIError as e:
+            if _is_quota_error(e) and attempt < 6:
+                _sleep_backoff(attempt)
+                continue
+            raise
