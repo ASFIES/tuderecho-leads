@@ -19,7 +19,7 @@ MX_TZ = ZoneInfo("America/Mexico_City")
 TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
 TAB_SYS = os.environ.get("TAB_SYS", "Config_Sistema").strip()
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://red-d5svi5v5r7bs73basen0:6379").strip()  # 🔥🔥🔥 URL de Render Redis
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()  # 🔥🔥🔥 URL de Render Redis
 REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()  # 🔥🔥🔥 nombre de cola: "ximena"
 
 app = Flask(__name__)
@@ -119,7 +119,7 @@ def whatsapp_webhook():
     # Flujo MVP: si llega "hola", inicia
     if estatus == "INICIO":
         resp.message(
-            "Hola, soy Ximena, asistente virtual del despacho *Tu Derecho Laboral México* ⚖️\n\n"
+            "Hola, soy Ximena, asistente virtual del despacho Tu Derecho Laboral México ⚖️\n\n"
             "Estoy aquí para acompañarte y orientarte paso a paso.\n\n"
             "En este proceso primero revisaremos nuestro aviso de privacidad. Después, te haré una serie de preguntas sencillas sobre tu relación laboral, como fechas y salario, para entender mejor tu situación.\n\n"
             "Con esta información podremos orientarte y, si así lo deseas, canalizar tu caso con un abogado de nuestro equipo solo nos llevara unos minutos.\n\n"
@@ -137,7 +137,10 @@ def whatsapp_webhook():
             resp.message("Por favor responde con 1 o 2.")
             return str(resp)
         if incoming == "2":
-            resp.message("Entendido. Si deseas retomar tu caso, escríbenos cuando gustes.")
+            resp.message(
+                "Entendido. Sin la aceptación del aviso de privacidad no podemos continuar.\n\n"
+                "Si cambias de opinión, escríbenos nuevamente. Gracias."
+            )
             ws.update_cell(lead_row, c_est, "FIN_NO_ACEPTA")
             return str(resp)
 
@@ -161,30 +164,7 @@ def whatsapp_webhook():
         if c_tipo:
             ws.update_cell(lead_row, c_tipo, incoming)
 
-        resp.message(
-            "Para entender mejor tu situación, dime cuál opción se adapta más a tu caso:\n\n"
-            "1️⃣ Me despidieron\n"
-            "2️⃣ Presenté mi renuncia"
-        )
-        ws.update_cell(lead_row, c_est, "CONFIRMACION_INICIO")
-        return str(resp)
-
-    if estatus == "CONFIRMACION_INICIO":
-        if incoming not in ("1", "2"):
-            resp.message("Responde con 1 o 2.")
-            return str(resp)
-        
-        if incoming == "2":
-            resp.message("Entendido. Si deseas retomar tu caso, escríbenos cuando gustes.")
-            ws.update_cell(lead_row, c_est, "FIN_NO_CONTINUA")
-            return str(resp)
-
-        resp.message(
-            "Gracias por compartirlo. Ahora te haré algunas preguntas sencillas para comprender mejor tu situación y brindarte una mejor orientación.\n\n"
-            "¿Te parece bien continuar?\n\n"
-            "1️⃣ Continuemos\n"
-            "2️⃣ No gracias"
-        )
+        resp.message("Para comenzar, ¿podrías indicarme tu nombre, por favor?")
         ws.update_cell(lead_row, c_est, "NOMBRE")
         return str(resp)
 
@@ -193,7 +173,7 @@ def whatsapp_webhook():
         if c_nom:
             ws.update_cell(lead_row, c_nom, incoming)
 
-        resp.message("Para comenzar, ¿podrías indicarme tu nombre, por favor?")
+        resp.message("Ahora, ¿me compartes tu apellido?")
         ws.update_cell(lead_row, c_est, "APELLIDO")
         return str(resp)
 
@@ -202,7 +182,10 @@ def whatsapp_webhook():
         if c_ap:
             ws.update_cell(lead_row, c_ap, incoming)
 
-        resp.message("Ahora, ¿me compartes tu apellido?")
+        resp.message(
+            "Si te sientes cómodo/a, describe brevemente lo que ocurrió con tu relación laboral.\n\n"
+            "No necesitas usar términos legales, solo cuéntanos con tus palabras (2–4 líneas)."
+        )
         ws.update_cell(lead_row, c_est, "DESCRIPCION")
         return str(resp)
 
@@ -215,10 +198,7 @@ def whatsapp_webhook():
         if c_desc:
             ws.update_cell(lead_row, c_desc, incoming)
 
-        resp.message(
-            "Si te sientes cómodo/a, describe brevemente lo que ocurrió con tu relación laboral.\n\n"
-            "No necesitas usar términos legales, solo cuéntanos con tus palabras (2–4 líneas)."
-        )
+        resp.message("Gracias. Dime el año en que iniciaste tu trabajo (ej. 2021).")
         ws.update_cell(lead_row, c_est, "INI_ANIO")
         return str(resp)
 
@@ -228,7 +208,7 @@ def whatsapp_webhook():
             return str(resp)
         c = col_idx(hm, "Inicio_Anio")
         if c: ws.update_cell(lead_row, c, incoming)
-        resp.message("Gracias. Dime el año en que iniciaste tu trabajo (ej. 2021).")
+        resp.message("Ahora indícame el mes de inicio en formato numérico (Ej. 1 enero-12 diciembre).")
         ws.update_cell(lead_row, c_est, "INI_MES")
         return str(resp)
 
@@ -238,7 +218,7 @@ def whatsapp_webhook():
             return str(resp)
         c = col_idx(hm, "Inicio_Mes")
         if c: ws.update_cell(lead_row, c, incoming)
-        resp.message("Ahora indícame el mes de inicio en formato numérico (Ej. 1 enero-12 diciembre).")
+        resp.message("Gracias. Ahora dime el día en que comenzaste a laborar (1 a 31).")
         ws.update_cell(lead_row, c_est, "INI_DIA")
         return str(resp)
 
@@ -248,7 +228,7 @@ def whatsapp_webhook():
             return str(resp)
         c = col_idx(hm, "Inicio_Dia")
         if c: ws.update_cell(lead_row, c, incoming)
-        resp.message("Gracias. Ahora dime el día en que comenzaste a laborar (1 a 31).")
+        resp.message("Ahora dime el año en que terminó la relación laboral (ej. 2024).")
         ws.update_cell(lead_row, c_est, "FIN_ANIO")
         return str(resp)
 
@@ -258,7 +238,7 @@ def whatsapp_webhook():
             return str(resp)
         c = col_idx(hm, "Fin_Anio")
         if c: ws.update_cell(lead_row, c, incoming)
-        resp.message("Ahora dime el año en que terminó la relación laboral (ej. 2024).")
+        resp.message("Gracias. Indícame el mes de término (1 a 12).")
         ws.update_cell(lead_row, c_est, "FIN_MES")
         return str(resp)
 
@@ -268,7 +248,7 @@ def whatsapp_webhook():
             return str(resp)
         c = col_idx(hm, "Fin_Mes")
         if c: ws.update_cell(lead_row, c, incoming)
-        resp.message("Gracias. Indícame el mes de término (1 a 12).")
+        resp.message("Finalmente, dime el día de término (1 a 31).")
         ws.update_cell(lead_row, c_est, "FIN_DIA")
         return str(resp)
 
@@ -278,12 +258,7 @@ def whatsapp_webhook():
             return str(resp)
         c = col_idx(hm, "Fin_Dia")
         if c: ws.update_cell(lead_row, c, incoming)
-        resp.message("Finalmente, dime el día de término (1 a 31).")
-        ws.update_cell(lead_row, c_est, "PRE_SALARIO")
-        return str(resp)
-    
-    if estatus == "PRE_SALARIO":
-        resp.message("¿Cuál era tu salario mensual en pesos mexicanos? (solo número, sin comas)")
+        resp.message("Cuál era tu salario mensual en pesos mexicanos? (solo número, sin comas)")
         ws.update_cell(lead_row, c_est, "SALARIO")
         return str(resp)
 
@@ -295,7 +270,8 @@ def whatsapp_webhook():
         if c_sal: ws.update_cell(lead_row, c_sal, incoming)
 
         resp.message(
-            "Aviso importante: La información que te brindamos es únicamente informativa y no constituye asesoría legal. La relación abogado-cliente se establece solo cuando un abogado acepta formalmente tu asunto.\n\n"
+            "Aviso importante: La información que te brindamos es únicamente informativa y no constituye asesoría legal. "
+            "La relación abogado-cliente se establece solo cuando un abogado acepta formalmente tu asunto.\n\n"
             "¿Deseas continuar?\n\n"
             "1️⃣ Continuar\n"
             "2️⃣ No deseo continuar"
@@ -309,17 +285,9 @@ def whatsapp_webhook():
             return str(resp)
 
         if incoming == "2":
-            resp.message("Entendido. Si deseas retomar tu caso, escríbenos cuando gustes.")
+            resp.message("Entendido. Si deseas retomar tu caso, escríbenos nuevamente.")
             ws.update_cell(lead_row, c_est, "FIN_NO_CONTINUA")
             return str(resp)
-            
-        resp.message(
-            "Gracias, ya tengo lo necesario ✅\n\n"
-            "Estoy preparando tu estimación preliminar y asignando a la abogada que llevará tu caso.\n"
-            "En un momento te envío el resultado por este medio."
-        )
-        ws.update_cell(lead_row, c_est, "FINALIZADO")
-        return str(resp)
 
         # 🔥🔥🔥 PASA A EN_PROCESO Y ENCOLA 1 JOB
         ws.update_cell(lead_row, c_est, "EN_PROCESO")
@@ -328,7 +296,7 @@ def whatsapp_webhook():
 
         resp.message(
             "Gracias, ya tengo lo necesario ✅\n\n"
-            "Estoy preparando tu *estimación preliminar* y asignando a la abogada que llevará tu caso.\n"
+            "Estoy preparando tu estimación preliminar y asignando a la abogada que llevará tu caso.\n"
             "En un momento te envío el resultado por este medio."
             + ("" if encolado else "\n\n(Ya estoy procesándolo, dame un momento 🙏)")
         )
@@ -337,11 +305,10 @@ def whatsapp_webhook():
     # Si ya está procesado y quedó en CLIENTE_MENU:
     if estatus == "CLIENTE_MENU":
         resp.message(
-            "✅ Ya tengo tu estimación preliminar.\n\n"
-            "¿Qué deseas hacer?\n"
-            "1) Ver informe\n"
-            "2) Hablar con un abogado\n"
-            "3) Terminar"
+            "Hola {Nombre} 👋 ¿Qué opción deseas?\n\n"
+            "1️⃣ Próximas fechas agendadas\n"
+            "2️⃣ Resumen de mi caso hasta hoy\n"
+            "3️⃣ Contactar a mi abogado"
         )
         return str(resp)
 
@@ -351,3 +318,4 @@ def whatsapp_webhook():
 @app.get("/")
 def health():
     return "OK", 200
+
