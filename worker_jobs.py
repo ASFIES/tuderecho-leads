@@ -59,4 +59,3 @@ def process_lead(lead_id: str):
     })
 
     return {"ok": True, "lead_id": lead_id, "estatus": "CLIENTE_MENU"}
-
