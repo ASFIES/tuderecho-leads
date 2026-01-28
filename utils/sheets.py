@@ -1,118 +1,196 @@
-# utils/sheets.py
 import os
 import json
-import base64
 import time
-from typing import Dict, Any, Tuple, List
+import random
+from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-
+# -------------------------
+# ENV
+# -------------------------
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-GOOGLE_CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "").strip()
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+# Cache control
+CONFIG_CACHE_TTL_SECONDS = int(os.environ.get("CONFIG_CACHE_TTL_SECONDS", "120"))  # 2 minutos
 
-
-def _get_env_creds_dict() -> Dict[str, Any]:
-    if GOOGLE_CREDENTIALS_JSON:
-        raw = GOOGLE_CREDENTIALS_JSON
-        if raw.lstrip().startswith("{"):
-            return json.loads(raw)
-        decoded = base64.b64decode(raw).decode("utf-8")
-        return json.loads(decoded)
-
-    if GOOGLE_CREDENTIALS_PATH:
-        with open(GOOGLE_CREDENTIALS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    raise RuntimeError("Faltan credenciales: GOOGLE_CREDENTIALS_JSON o GOOGLE_CREDENTIALS_PATH")
+# Lazy globals
+_GC = None
+_SH = None
 
 
-def get_gspread_client():
-    info = _get_env_creds_dict()
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return gspread.authorize(creds)
+def _get_creds() -> Credentials:
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    if GOOGLE_CREDS_JSON:
+        info = json.loads(GOOGLE_CREDS_JSON)
+        return Credentials.from_service_account_info(info, scopes=scopes)
+
+    if GOOGLE_CREDS_PATH:
+        return Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
+
+    raise RuntimeError(
+        "Falta GOOGLE_CREDENTIALS_JSON o GOOGLE_APPLICATION_CREDENTIALS en variables de entorno."
+    )
 
 
-def open_spreadsheet(gc):
-    if not GOOGLE_SHEET_NAME:
-        raise RuntimeError("Falta GOOGLE_SHEET_NAME")
-    return gc.open(GOOGLE_SHEET_NAME)
+def get_gspread_client() -> gspread.Client:
+    global _GC
+    if _GC is None:
+        creds = _get_creds()
+        _GC = gspread.authorize(creds)
+    return _GC
 
 
-def build_header_map(headers: List[str]) -> Dict[str, int]:
-    m = {}
-    for i, h in enumerate(headers, start=1):
-        key = (h or "").strip()
-        if not key:
-            continue
-        if key not in m:
-            m[key] = i
-        low = key.lower()
-        if low not in m:
-            m[low] = i
-    return m
+def open_spreadsheet():
+    global _SH
+    if _SH is None:
+        if not GOOGLE_SHEET_NAME:
+            raise RuntimeError("Falta GOOGLE_SHEET_NAME en variables de entorno.")
+        gc = get_gspread_client()
+        _SH = gc.open(GOOGLE_SHEET_NAME)
+    return _SH
 
 
-def col_idx(header_map: Dict[str, int], name: str):
-    return header_map.get(name) or header_map.get((name or "").lower())
+def open_worksheet(tab_name: str):
+    sh = open_spreadsheet()
+    return sh.worksheet(tab_name)
 
 
-def with_backoff(func, max_tries=6, base_sleep=0.8):
-    """
-    Backoff simple para errores 429/5xx de Google.
-    """
-    last_err = None
-    for i in range(max_tries):
-        try:
-            return func()
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            # Detecta 429 / quota / rate limit
-            if ("429" in msg) or ("quota" in msg) or ("rate" in msg):
-                time.sleep(base_sleep * (2 ** i))
-                continue
-            raise
-    raise last_err
+# -------------------------
+# Redis cache (opcional)
+# -------------------------
+def _redis():
+    # Import local para no romper si no está instalado en local
+    try:
+        from redis import Redis
+    except Exception:
+        return None
+
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if not redis_url:
+        return None
+    try:
+        return Redis.from_url(redis_url, decode_responses=True)
+    except Exception:
+        return None
 
 
-def read_row_range(ws, row_idx: int, min_col: int, max_col: int) -> List[str]:
-    """
-    Lee una sola fila por rango A1. 1 request.
-    """
-    a1 = gspread.utils.rowcol_to_a1(row_idx, min_col)
-    b1 = gspread.utils.rowcol_to_a1(row_idx, max_col)
-    rng = f"{a1}:{b1}"
-
-    def _do():
-        values = ws.get(rng)  # retorna [[...]] o []
-        return values[0] if values else []
-
-    return with_backoff(_do)
+def _cache_get(key: str) -> Optional[str]:
+    r = _redis()
+    if not r:
+        return None
+    try:
+        return r.get(key)
+    except Exception:
+        return None
 
 
-def batch_update_row(ws, row_idx: int, updates: Dict[int, Any]):
-    """
-    updates: {col_number: value}
-    1 request (batch_update).
-    """
-    data = []
-    for col_num, val in updates.items():
-        a1 = gspread.utils.rowcol_to_a1(row_idx, col_num)
-        data.append({"range": a1, "values": [[val]]})
-
-    if not data:
+def _cache_set(key: str, value: str, ttl: int):
+    r = _redis()
+    if not r:
+        return
+    try:
+        r.setex(key, ttl, value)
+    except Exception:
         return
 
-    def _do():
-        ws.batch_update(data)
 
-    with_backoff(_do)
+# -------------------------
+# Backoff / Retry for 429
+# -------------------------
+def _with_backoff(fn, max_tries: int = 6):
+    """
+    Reintenta cuando Google corta por cuota (429) u otros errores temporales.
+    """
+    for i in range(max_tries):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e).lower()
+            is_quota = ("429" in msg) or ("quota" in msg) or ("read requests" in msg)
+            if not is_quota and i >= 1:
+                # si no parece cuota y ya falló una vez, no insistas
+                raise
 
+            sleep_s = (2 ** i) + random.random()
+            time.sleep(min(sleep_s, 20))
+    # si llegamos aquí, re-lanzamos el último intento
+    return fn()
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def get_all_records_cached(tab_name: str, cache_key: str) -> List[Dict[str, Any]]:
+    """
+    Para Configs: cacheamos en Redis para no leer Sheets cada mensaje.
+    """
+    ck = f"cfg:{cache_key}:{tab_name}"
+    cached = _cache_get(ck)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    ws = open_worksheet(tab_name)
+    records = _with_backoff(lambda: ws.get_all_records())
+    _cache_set(ck, json.dumps(records, ensure_ascii=False), CONFIG_CACHE_TTL_SECONDS)
+    return records
+
+
+def find_row_by_value(ws, col_name: str, value: str) -> Optional[int]:
+    """
+    Busca fila por valor exacto en una columna (usando cabeceras).
+    """
+    headers = _with_backoff(lambda: ws.row_values(1))
+    if col_name not in headers:
+        raise RuntimeError(f"No existe la columna '{col_name}' en la hoja {ws.title}")
+    col_idx = headers.index(col_name) + 1
+
+    def _get_col():
+        return ws.col_values(col_idx)
+
+    col_vals = _with_backoff(_get_col)
+    for i, v in enumerate(col_vals[1:], start=2):  # desde fila 2
+        if str(v).strip() == str(value).strip():
+            return i
+    return None
+
+
+def update_row_dict(ws, row: int, updates: Dict[str, Any]):
+    """
+    Actualiza varias columnas en una fila con un solo batch (reduce lecturas/escrituras).
+    """
+    headers = _with_backoff(lambda: ws.row_values(1))
+    cells = []
+    for k, v in updates.items():
+        if k not in headers:
+            # si no existe la columna, ignora (para no romper producción)
+            continue
+        col_idx = headers.index(k) + 1
+        cells.append((row, col_idx, v))
+
+    if not cells:
+        return
+
+    def _batch():
+        cell_list = ws.range(min(r for r, c, _ in cells),
+                             min(c for r, c, _ in cells),
+                             max(r for r, c, _ in cells),
+                             max(c for r, c, _ in cells))
+        # mapa para setear solo lo necesario
+        for cell in cell_list:
+            for rr, cc, vv in cells:
+                if cell.row == rr and cell.col == cc:
+                    cell.value = "" if vv is None else str(vv)
+        ws.update_cells(cell_list)
+
+    _with_backoff(_batch)

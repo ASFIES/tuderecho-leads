@@ -1,26 +1,45 @@
 import os
-from flask import Flask, render_template
-from utils.sheets import get_gspread_client, open_spreadsheet, open_worksheet, get_all_records_cached
+from flask import Flask, request, abort
+
+from utils.sheets import open_worksheet, find_row_by_value
+
+TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
 
 app = Flask(__name__)
 
-GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
-TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
-
 @app.get("/")
-def health():
-    return "ok", 200
+def home():
+    return "Reporte OK"
 
-@app.get("/reporte/<token>")
-def ver_reporte(token):
-    gc = get_gspread_client()
-    sh = open_spreadsheet(gc, GOOGLE_SHEET_NAME)
-    ws = open_worksheet(sh, TAB_LEADS)
+@app.get("/r")
+def report():
+    token = (request.args.get("t") or "").strip()
+    if not token:
+        abort(400, "Falta token ?t=")
 
-    rows = get_all_records_cached(ws, cache_key="bd_leads_report", ttl=60)
-    lead = next((r for r in rows if (r.get("Token_Reporte") or "").strip() == token.strip()), None)
+    ws = open_worksheet(TAB_LEADS)
+    row = find_row_by_value(ws, "Token_Reporte", token)
+    if not row:
+        abort(404, "Token no encontrado")
 
-    if not lead:
-        return "Reporte no encontrado.", 404
+    headers = ws.row_values(1)
+    values = ws.row_values(row)
+    data = {headers[i]: (values[i] if i < len(values) else "") for i in range(len(headers))}
 
-    return render_template("reporte.html", lead=lead)
+    nombre = data.get("Nombre", "")
+    analisis = data.get("Analisis_AI", "")
+    resultado = data.get("Resultado_Calculo", "")
+
+    html = f"""
+    <html>
+      <head><meta charset="utf-8"><title>Reporte</title></head>
+      <body style="font-family: Arial; padding: 20px;">
+        <h2>Reporte preliminar</h2>
+        <p><b>Cliente:</b> {nombre}</p>
+        <p><b>Resultado cálculo:</b> {resultado}</p>
+        <h3>Análisis</h3>
+        <pre style="white-space: pre-wrap;">{analisis}</pre>
+      </body>
+    </html>
+    """
+    return html
