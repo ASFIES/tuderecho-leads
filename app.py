@@ -1,564 +1,305 @@
+# app.py
 import os
-import json
-import base64
-import uuid
 import re
-import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 
-import gspread
-from google.oauth2.service_account import Credentials
-
-# Redis / RQ
 from redis import Redis
 from rq import Queue
 
-# Job module
-import worker_jobs
+import gspread
+from utils.sheets import get_gspread_client, open_spreadsheet, build_header_map, col_idx, with_backoff
 
-# =========================
-# App
-# =========================
-app = Flask(__name__)
-
-# =========================
-# Env
-# =========================
-GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
-
-TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
-TAB_CONFIG = os.environ.get("TAB_CONFIG", "Config_XimenaAI").strip()
-TAB_LOGS = os.environ.get("TAB_LOGS", "Logs").strip()
-
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-GOOGLE_CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "").strip()
-
-# Redis env (ya los tienes)
-REDIS_URL = os.environ.get("REDIS_URL", "").strip()
-REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
-
-# =========================
-# Time (MX)
-# =========================
 MX_TZ = ZoneInfo("America/Mexico_City")
 
-def now_iso_mx():
+# ===== ENV =====
+TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
+TAB_SYS = os.environ.get("TAB_SYS", "Config_Sistema").strip()
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://red-d5svi5v5r7bs73basen0:6379").strip()  # 🔥🔥🔥 URL de Render Redis
+REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()  # 🔥🔥🔥 nombre de cola: "ximena"
+
+app = Flask(__name__)
+
+def now_iso():
     return datetime.now(MX_TZ).isoformat(timespec="seconds")
 
-# =========================
-# Twilio Reply
-# =========================
-def safe_reply(text: str):
-    resp = MessagingResponse()
-    resp.message(text)
-    return str(resp)
+def normalize_phone(p: str) -> str:
+    p = (p or "").strip()
+    p = p.replace("whatsapp:", "")
+    return re.sub(r"\D+", "", p)
 
-def render_text(s: str) -> str:
-    s = s or ""
-    return s.replace("\\n", "\n")
-
-# =========================
-# Normalización
-# =========================
-def phone_raw(raw: str) -> str:
-    return (raw or "").strip()
-
-def phone_norm(raw: str) -> str:
-    s = (raw or "").strip()
-    s = s.replace("whatsapp:", "").strip()
-    return s
-
-def normalize_msg(s: str) -> str:
-    s = (s or "").strip()
-    s = unicodedata.normalize("NFKC", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def normalize_option(s: str) -> str:
-    s = normalize_msg(s)
-    m = re.search(r"\d", s)
-    if m:
-        return m.group(0)
-    return s
-
-# =========================
-# Fuente Lead
-# =========================
-def detect_fuente(msg: str) -> str:
-    t = (msg or "").lower()
-    if "facebook" in t or "anuncio" in t or "fb" in t:
-        return "FACEBOOK"
-    if "sitio" in t or "web" in t or "pagina" in t or "página" in t:
-        return "WEB"
-    return "DESCONOCIDA"
-
-# =========================
-# Redis queue
-# =========================
-def get_rq_queue():
+def enqueue_process_lead(lead_row: int, lead_id: str) -> bool:
+    """
+    🔥🔥🔥 Encola SOLO 1 job por lead usando lock Redis.
+    """
     if not REDIS_URL:
-        raise RuntimeError("Falta REDIS_URL en el servicio Webhook.")
-    conn = Redis.from_url(REDIS_URL)
-    return Queue(REDIS_QUEUE_NAME, connection=conn)
+        return False
 
-def enqueue_process_lead(lead_id: str):
-    """
-    Encola worker_jobs.process_lead(lead_id) en RQ.
-    """
-    q = get_rq_queue()
-    # job_timeout: segundos máximos permitidos para ejecutar el cálculo
-    q.enqueue(worker_jobs.process_lead, lead_id, job_timeout=180)
+    r = Redis.from_url(REDIS_URL)
+    lock_key = f"lock:lead:{lead_id}"
 
-# =========================
-# Google creds + gspread
-# =========================
-def get_env_creds_dict():
-    if GOOGLE_CREDENTIALS_JSON:
-        raw = GOOGLE_CREDENTIALS_JSON
-        try:
-            if raw.lstrip().startswith("{"):
-                return json.loads(raw)
-            decoded = base64.b64decode(raw).decode("utf-8")
-            return json.loads(decoded)
-        except Exception as e:
-            raise RuntimeError(f"GOOGLE_CREDENTIALS_JSON inválido (JSON/base64). Detalle: {e}")
+    # NX = solo si NO existe; EX=180s evita duplicados por reintentos
+    ok = r.set(lock_key, "1", nx=True, ex=180)
+    if not ok:
+        return False
 
-    if GOOGLE_CREDENTIALS_PATH:
-        if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
-            raise RuntimeError("GOOGLE_CREDENTIALS_PATH no existe en el filesystem del servicio.")
-        with open(GOOGLE_CREDENTIALS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    raise RuntimeError("Faltan credenciales: usa GOOGLE_CREDENTIALS_JSON o GOOGLE_CREDENTIALS_PATH.")
-
-def get_gspread_client():
-    creds_info = get_env_creds_dict()
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-    return gspread.authorize(creds)
-
-def open_spreadsheet(gc):
-    if not GOOGLE_SHEET_NAME:
-        raise RuntimeError("Falta GOOGLE_SHEET_NAME.")
-    return gc.open(GOOGLE_SHEET_NAME)
-
-def open_worksheet(sh, title: str):
-    try:
-        return sh.worksheet(title)
-    except Exception:
-        raise RuntimeError(f"No existe la pestaña '{title}' en el Google Sheet '{GOOGLE_SHEET_NAME}'.")
-
-# =========================
-# Headers / Sheet utils
-# =========================
-def build_header_map(ws):
-    headers = ws.row_values(1)
-    m = {}
-    for i, h in enumerate(headers, start=1):
-        key = (h or "").strip()
-        if not key:
-            continue
-        if key not in m:
-            m[key] = i
-        low = key.lower()
-        if low not in m:
-            m[low] = i
-    return m
-
-def col_idx(headers_map: dict, name: str):
-    return headers_map.get(name) or headers_map.get((name or "").lower())
-
-def find_row_by_value(ws, col_idx_num: int, value: str):
-    value = (value or "").strip()
-    if not value:
-        return None
-    col_values = ws.col_values(col_idx_num)
-    for i, v in enumerate(col_values[1:], start=2):
-        if (v or "").strip() == value:
-            return i
-    return None
-
-def update_cells_batch(ws, updates_a1_to_value: dict):
-    payload = [{"range": a1, "values": [[val]]} for a1, val in updates_a1_to_value.items()]
-    if payload:
-        ws.batch_update(payload)
-
-def update_lead_batch(ws, header_map: dict, row_idx: int, updates: dict):
-    to_send = {}
-    for col_name, val in (updates or {}).items():
-        idx = col_idx(header_map, col_name)
-        if not idx:
-            continue
-        a1 = gspread.utils.rowcol_to_a1(row_idx, idx)
-        to_send[a1] = val
-    update_cells_batch(ws, to_send)
-
-def safe_log(ws_logs, data: dict):
-    try:
-        cols = [
-            "ID_Log", "Fecha_Hora", "Telefono", "ID_Lead", "Paso",
-            "Mensaje_Entrante", "Mensaje_Saliente",
-            "Canal", "Fuente_Lead", "Modelo_AI", "Errores"
-        ]
-        row = [data.get(c, "") for c in cols]
-        ws_logs.append_row(row, value_input_option="USER_ENTERED")
-    except Exception:
-        pass
-
-# =========================
-# Load Config row
-# =========================
-def load_config_row(ws_config, paso_actual: str):
-    cfg_headers = build_header_map(ws_config)
-    idpaso_col = col_idx(cfg_headers, "ID_Paso")
-    if not idpaso_col:
-        raise RuntimeError("En Config_XimenaAI falta la columna 'ID_Paso'.")
-
-    paso_actual = (paso_actual or "").strip() or "INICIO"
-    row = find_row_by_value(ws_config, idpaso_col, paso_actual)
-    if not row and paso_actual != "INICIO":
-        row = find_row_by_value(ws_config, idpaso_col, "INICIO")
-    if not row:
-        raise RuntimeError(f"No existe configuración para el paso '{paso_actual}'.")
-
-    row_vals = ws_config.row_values(row)
-
-    base_fields = [
-        "ID_Paso", "Texto_Bot", "Tipo_Entrada", "Opciones_Validas",
-        "Siguiente_Si_1", "Siguiente_Si_2",
-        "Campo_BD_Leads_A_Actualizar", "Regla_Validacion", "Mensaje_Error"
-    ]
-    extra_siguientes = [f"Siguiente_Si_{i}" for i in range(3, 10)]
-
-    def get_field(name):
-        idx = col_idx(cfg_headers, name)
-        return (row_vals[idx-1] if idx and idx-1 < len(row_vals) else "").strip()
-
-    out = {k: get_field(k) for k in base_fields}
-    for k in extra_siguientes:
-        out[k] = get_field(k)
-    return out
-
-# =========================
-# Leads: get/create
-# =========================
-def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_normed: str, fuente: str):
-    tel_col = col_idx(leads_headers, "Telefono")
-    if not tel_col:
-        raise RuntimeError("En BD_Leads falta la columna 'Telefono'.")
-
-    row = find_row_by_value(ws_leads, tel_col, tel_raw) or find_row_by_value(ws_leads, tel_col, tel_normed)
-    if row:
-        vals = ws_leads.row_values(row)
-        idx_id = col_idx(leads_headers, "ID_Lead")
-        idx_est = col_idx(leads_headers, "ESTATUS")
-        idx_fuente = col_idx(leads_headers, "Fuente_Lead")
-
-        lead_id = (vals[idx_id - 1] or "").strip() if idx_id and idx_id - 1 < len(vals) else ""
-        estatus = (vals[idx_est - 1] or "").strip() if idx_est and idx_est - 1 < len(vals) else "INICIO"
-        fuente_actual = (vals[idx_fuente - 1] or "").strip() if idx_fuente and idx_fuente - 1 < len(vals) else ""
-
-        if (not fuente_actual) and fuente and fuente != "DESCONOCIDA":
-            update_lead_batch(ws_leads, leads_headers, row, {"Fuente_Lead": fuente})
-
-        return row, lead_id, estatus or "INICIO", False
-
-    lead_id = str(uuid.uuid4())
-    headers_row = ws_leads.row_values(1)
-    new_row = [""] * max(1, len(headers_row))
-
-    def set_if(col_name, val):
-        idx = col_idx(leads_headers, col_name)
-        if idx and idx <= len(new_row):
-            new_row[idx - 1] = val
-
-    set_if("ID_Lead", lead_id)
-    set_if("Telefono", tel_raw)
-    set_if("Telefono_Normalizado", tel_normed)
-    set_if("Fuente_Lead", fuente or "DESCONOCIDA")
-    set_if("Fecha_Registro", now_iso_mx())
-    set_if("Ultima_Actualizacion", now_iso_mx())
-    set_if("ESTATUS", "INICIO")
-
-    ws_leads.append_row(new_row, value_input_option="USER_ENTERED")
-    row = find_row_by_value(ws_leads, tel_col, tel_raw) or find_row_by_value(ws_leads, tel_col, tel_normed)
-    return row, lead_id, "INICIO", True
-
-# =========================
-# Validations
-# =========================
-def is_valid_by_rule(value: str, rule: str) -> bool:
-    value = (value or "").strip()
-    rule = (rule or "").strip()
-    if not rule:
-        return True
-
-    if rule.startswith("REGEX:"):
-        pattern = rule.replace("REGEX:", "", 1).strip()
-        try:
-            return re.match(pattern, value) is not None
-        except:
-            return False
-
-    if rule == "MONEY":
-        try:
-            x = float(value.replace("$", "").replace(",", "").strip())
-            return x >= 0
-        except:
-            return False
-
+    q = Queue(REDIS_QUEUE_NAME, connection=r)
+    q.enqueue("worker_jobs.process_lead", lead_row, lead_id, job_timeout=120)
     return True
 
-# =========================
-# Build date from parts
-# =========================
-def build_date_from_parts(y: str, m: str, d: str) -> str:
-    y = (y or "").strip()
-    m = (m or "").strip()
-    d = (d or "").strip()
-    if not (y and m and d):
-        return ""
-    try:
-        yy = int(y); mm = int(m); dd = int(d)
-        dt = datetime(yy, mm, dd)
-        return dt.strftime("%Y-%m-%d")
-    except:
-        return ""
+def get_or_create_lead(ws, telefono_norm: str):
+    """
+    Busca lead por Telefono_Normalizado. Si no existe, crea fila nueva.
+    Retorna: (row_idx, lead_id, headers_map)
+    """
+    headers = with_backoff(lambda: ws.row_values(1))
+    hm = build_header_map(headers)
 
-# =========================
-# Next step helper (OPCIONES)
-# =========================
-def pick_next_step_from_option(cfg: dict, msg_opt: str, default_step: str):
-    k = f"Siguiente_Si_{msg_opt}"
-    if cfg.get(k):
-        return cfg.get(k).strip()
-    if msg_opt == "1" and cfg.get("Siguiente_Si_1"):
-        return cfg.get("Siguiente_Si_1").strip()
-    if msg_opt == "2" and cfg.get("Siguiente_Si_2"):
-        return cfg.get("Siguiente_Si_2").strip()
-    return default_step
+    c_tel = col_idx(hm, "Telefono_Normalizado") or col_idx(hm, "Telefono")
+    c_id = col_idx(hm, "ID_Lead")
+    c_est = col_idx(hm, "ESTATUS")
+    c_freg = col_idx(hm, "Fecha_Registro")
+    c_uact = col_idx(hm, "Ultima_Actualizacion")
+    c_tel_raw = col_idx(hm, "Telefono")
 
-# =========================
-# Routes
-# =========================
-@app.get("/")
-def health():
-    return "ok", 200
+    if not (c_tel and c_id and c_est):
+        raise RuntimeError("BD_Leads debe tener columnas: ID_Lead, Telefono_Normalizado, ESTATUS")
+
+    # Lee toda la columna de teléfonos normalizados (1 request grande; MVP)
+    col_vals = with_backoff(lambda: ws.col_values(c_tel))
+    # col_vals incluye header en index 0
+    for i in range(2, len(col_vals) + 1):
+        if (col_vals[i-1] or "").strip() == telefono_norm:
+            lead_id = (ws.cell(i, c_id).value or "").strip()
+            return i, lead_id, hm
+
+    # Crear nuevo lead
+    lead_id = f"{telefono_norm}-{os.urandom(3).hex()}"
+    row = [""] * len(headers)
+
+    def setv(col, val):
+        if col and 1 <= col <= len(row):
+            row[col-1] = val
+
+    setv(c_id, lead_id)
+    setv(c_tel, telefono_norm)
+    setv(c_tel_raw, f"whatsapp:+{telefono_norm}")
+    setv(c_est, "INICIO")
+    setv(c_freg, now_iso())
+    setv(c_uact, now_iso())
+
+    with_backoff(lambda: ws.append_row(row, value_input_option="USER_ENTERED"))
+    # nueva fila al final
+    new_row_idx = len(with_backoff(lambda: ws.col_values(1)))
+    return new_row_idx, lead_id, hm
 
 @app.post("/whatsapp")
 def whatsapp_webhook():
-    from_phone_raw = phone_raw(request.form.get("From") or "")
-    from_phone_normed = phone_norm(from_phone_raw)
+    incoming = (request.form.get("Body") or "").strip()
+    from_ = (request.form.get("From") or "").strip()
 
-    body_raw = request.form.get("Body") or ""
-    msg_in = normalize_msg(body_raw)
-    msg_opt = normalize_option(body_raw)
+    phone_norm = normalize_phone(from_)
 
-    canal = "WHATSAPP"
-    modelo_ai = ""  # aquí ya no usamos OpenAI en webhook
+    gc = get_gspread_client()
+    sh = open_spreadsheet(gc)
+    ws = sh.worksheet(TAB_LEADS)
 
-    if not msg_in:
-        return safe_reply("Hola 👋")
+    lead_row, lead_id, hm = get_or_create_lead(ws, phone_norm)
 
-    fuente = detect_fuente(msg_in)
+    # Obtén estatus actual
+    c_est = col_idx(hm, "ESTATUS")
+    estatus = (ws.cell(lead_row, c_est).value or "").strip() if c_est else "INICIO"
 
-    try:
-        gc = get_gspread_client()
-        sh = open_spreadsheet(gc)
-        ws_leads = open_worksheet(sh, TAB_LEADS)
-        ws_config = open_worksheet(sh, TAB_CONFIG)
-        ws_logs = open_worksheet(sh, TAB_LOGS)
-    except Exception:
-        return safe_reply("⚠️ Por el momento no puedo acceder a la base de datos. Intenta de nuevo en unos minutos.")
+    resp = MessagingResponse()
 
-    leads_headers = build_header_map(ws_leads)
+    # Flujo MVP: si llega "hola", inicia
+    if estatus == "INICIO":
+        resp.message(
+            "Hola, soy Ximena, asistente virtual de *Tu Derecho Laboral México*.\n\n"
+            "Te acompañaré durante todo el proceso hasta asignarte un abogado.\n\n"
+            "¿Deseas continuar?\n"
+            "1) Sí\n"
+            "2) No"
+        )
+        # Cambia a AVISO_PRIVACIDAD
+        ws.update_cell(lead_row, c_est, "AVISO_PRIVACIDAD")
+        return str(resp)
 
-    lead_row, lead_id, estatus_actual, created = get_or_create_lead(
-        ws_leads, leads_headers, from_phone_raw, from_phone_normed, fuente
-    )
+    if estatus == "AVISO_PRIVACIDAD":
+        if incoming not in ("1", "2"):
+            resp.message("Por favor responde con 1 o 2.")
+            return str(resp)
+        if incoming == "2":
+            resp.message("Entendido. Si deseas retomar tu caso, escríbenos cuando gustes.")
+            ws.update_cell(lead_row, c_est, "FIN_NO_ACEPTA")
+            return str(resp)
 
-    headers_list = ws_leads.row_values(1)
-    row_vals = ws_leads.row_values(lead_row)
-    lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
+        resp.message("Perfecto. Continuemos:\n1) Me acaban de despedir\n2) Tuve que renunciar")
+        ws.update_cell(lead_row, c_est, "CASO_TIPO")
+        return str(resp)
 
-    errores = ""
+    if estatus == "CASO_TIPO":
+        if incoming not in ("1", "2"):
+            resp.message("Responde con 1 o 2.")
+            return str(resp)
 
-    # ========== NEW LEAD ==========
-    if created:
-        cfg_inicio = load_config_row(ws_config, "INICIO")
-        out = render_text(cfg_inicio.get("Texto_Bot") or "Hola, soy Ximena AI 👋")
-        update_lead_batch(ws_leads, leads_headers, lead_row, {
-            "ESTATUS": "INICIO",
-            "Ultimo_Mensaje_Cliente": msg_in,
-            "Ultima_Actualizacion": now_iso_mx(),
-            "Fuente_Lead": lead_snapshot.get("Fuente_Lead") or fuente,
-        })
-        safe_log(ws_logs, {
-            "ID_Log": str(uuid.uuid4()),
-            "Fecha_Hora": now_iso_mx(),
-            "Telefono": from_phone_raw,
-            "ID_Lead": lead_id,
-            "Paso": "INICIO",
-            "Mensaje_Entrante": msg_in,
-            "Mensaje_Saliente": out,
-            "Canal": canal,
-            "Fuente_Lead": lead_snapshot.get("Fuente_Lead") or fuente,
-            "Modelo_AI": modelo_ai,
-            "Errores": errores.strip(),
-        })
-        return safe_reply(out)
+        # Guarda Tipo_Caso
+        c_tipo = col_idx(hm, "Tipo_Caso")
+        if c_tipo:
+            ws.update_cell(lead_row, c_tipo, incoming)
 
-    # Fail-safe: saltar CORREO si existiera por error
-    if (estatus_actual or "").strip().upper() == "CORREO":
-        estatus_actual = "DESCRIPCION"
+        resp.message("De acuerdo. Empecemos, por favor dime tu *nombre*.")
+        ws.update_cell(lead_row, c_est, "NOMBRE")
+        return str(resp)
 
-    try:
-        cfg = load_config_row(ws_config, estatus_actual)
-    except Exception as e:
-        errores += f"LoadCfg_Err: {e}. "
-        return safe_reply("⚠️ Tuvimos un problema interno. Intenta de nuevo en unos minutos.")
+    if estatus == "NOMBRE":
+        c_nom = col_idx(hm, "Nombre")
+        if c_nom:
+            ws.update_cell(lead_row, c_nom, incoming)
 
-    paso_actual = (cfg.get("ID_Paso") or estatus_actual or "INICIO").strip()
-    tipo = (cfg.get("Tipo_Entrada") or "").upper().strip()
-    texto_bot = render_text(cfg.get("Texto_Bot") or "")
+        resp.message("Gracias. Ahora tu *apellido*.")
+        ws.update_cell(lead_row, c_est, "APELLIDO")
+        return str(resp)
 
-    opciones_validas = [normalize_option(x) for x in (cfg.get("Opciones_Validas") or "").split(",") if x.strip()]
-    campo_update = (cfg.get("Campo_BD_Leads_A_Actualizar") or "").strip()
-    regla = (cfg.get("Regla_Validacion") or "").strip()
-    msg_error = render_text((cfg.get("Mensaje_Error") or "Respuesta inválida.").strip())
+    if estatus == "APELLIDO":
+        c_ap = col_idx(hm, "Apellido")
+        if c_ap:
+            ws.update_cell(lead_row, c_ap, incoming)
 
-    next_paso = paso_actual
-    out = texto_bot
+        resp.message("Describe brevemente tu situación (mínimo 10 caracteres).")
+        ws.update_cell(lead_row, c_est, "DESCRIPCION")
+        return str(resp)
 
-    # ======================
-    # OPCIONES
-    # ======================
-    if tipo == "OPCIONES":
-        if opciones_validas and msg_opt not in opciones_validas:
-            out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
-            next_paso = paso_actual
-        else:
-            # Guardar en BD si aplica (nunca correo)
-            if campo_update and campo_update.lower() != "correo":
-                update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_opt})
+    if estatus == "DESCRIPCION":
+        if len(incoming) < 10:
+            resp.message("Escribe un poco más (mínimo 10 caracteres).")
+            return str(resp)
 
-            # Determinar siguiente paso
-            next_paso = pick_next_step_from_option(cfg, msg_opt, paso_actual)
+        c_desc = col_idx(hm, "Descripcion_Situacion")
+        if c_desc:
+            ws.update_cell(lead_row, c_desc, incoming)
 
-            # Salto forzado si por error apunta a CORREO
-            if next_paso.upper() == "CORREO":
-                next_paso = "DESCRIPCION"
+        resp.message("Gracias. Dime el *AÑO* de inicio (ej. 2020).")
+        ws.update_cell(lead_row, c_est, "INI_ANIO")
+        return str(resp)
 
-            # Cargar cfg del siguiente paso
-            cfg2 = load_config_row(ws_config, next_paso)
+    if estatus == "INI_ANIO":
+        if not re.match(r"^(19\d{2}|20\d{2})$", incoming):
+            resp.message("Escribe un año válido (ej. 2018, 2020, 2024).")
+            return str(resp)
+        c = col_idx(hm, "Inicio_Anio")
+        if c: ws.update_cell(lead_row, c, incoming)
+        resp.message("Ahora el *MES* de inicio (1 a 12).")
+        ws.update_cell(lead_row, c_est, "INI_MES")
+        return str(resp)
 
-            # ✅ Caso especial: EN_PROCESO => encolar job y responder texto
-            if next_paso.strip().upper() == "EN_PROCESO":
-                try:
-                    enqueue_process_lead(lead_id)
-                except Exception as e:
-                    errores += f"Enqueue_Err: {e}. "
-                out = render_text(cfg2.get("Texto_Bot") or "Gracias. Estoy preparando tu estimación…")
-            else:
-                out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
+    if estatus == "INI_MES":
+        if not re.match(r"^(1[0-2]|[1-9])$", incoming):
+            resp.message("Escribe un mes del 1 al 12.")
+            return str(resp)
+        c = col_idx(hm, "Inicio_Mes")
+        if c: ws.update_cell(lead_row, c, incoming)
+        resp.message("Ahora el *DÍA* de inicio (1 a 31).")
+        ws.update_cell(lead_row, c_est, "INI_DIA")
+        return str(resp)
 
-    # ======================
-    # TEXTO
-    # ======================
-    elif tipo == "TEXTO":
-        if not is_valid_by_rule(msg_in, regla):
-            out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
-            next_paso = paso_actual
-        else:
-            # guardar campo (nunca correo)
-            if campo_update and campo_update.lower() != "correo":
-                update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_in})
+    if estatus == "INI_DIA":
+        if not re.match(r"^(3[01]|[12]\d|[1-9])$", incoming):
+            resp.message("Escribe un día del 1 al 31.")
+            return str(resp)
+        c = col_idx(hm, "Inicio_Dia")
+        if c: ws.update_cell(lead_row, c, incoming)
+        resp.message("Dime el *AÑO* de término (ej. 2025).")
+        ws.update_cell(lead_row, c_est, "FIN_ANIO")
+        return str(resp)
 
-            # refrescar snapshot
-            row_vals = ws_leads.row_values(lead_row)
-            lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
+    if estatus == "FIN_ANIO":
+        if not re.match(r"^(19\d{2}|20\d{2})$", incoming):
+            resp.message("Escribe un año válido (ej. 2020, 2023, 2025).")
+            return str(resp)
+        c = col_idx(hm, "Fin_Anio")
+        if c: ws.update_cell(lead_row, c, incoming)
+        resp.message("Ahora el *MES* de término (1 a 12).")
+        ws.update_cell(lead_row, c_est, "FIN_MES")
+        return str(resp)
 
-            # ----- FIX: INI_DIA debe avanzar -----
-            if paso_actual.upper() == "INI_DIA":
-                fecha_ini = build_date_from_parts(
-                    lead_snapshot.get("Inicio_Anio"),
-                    lead_snapshot.get("Inicio_Mes"),
-                    lead_snapshot.get("Inicio_Dia"),
-                )
-                if not fecha_ini:
-                    out = "Ups, esa fecha no parece válida. Por favor escribe nuevamente el *DÍA* (1 a 31)."
-                    next_paso = "INI_DIA"
-                else:
-                    update_lead_batch(ws_leads, leads_headers, lead_row, {"Fecha_Inicio_Laboral": fecha_ini})
-                    next_paso = "FIN_ANIO"  # ✅ FORZAR AVANCE
+    if estatus == "FIN_MES":
+        if not re.match(r"^(1[0-2]|[1-9])$", incoming):
+            resp.message("Escribe un mes del 1 al 12.")
+            return str(resp)
+        c = col_idx(hm, "Fin_Mes")
+        if c: ws.update_cell(lead_row, c, incoming)
+        resp.message("Finalmente el *DÍA* de término (1 a 31).")
+        ws.update_cell(lead_row, c_est, "FIN_DIA")
+        return str(resp)
 
-            # ----- FIX: FIN_DIA debe avanzar -----
-            elif paso_actual.upper() == "FIN_DIA":
-                fecha_fin = build_date_from_parts(
-                    lead_snapshot.get("Fin_Anio"),
-                    lead_snapshot.get("Fin_Mes"),
-                    lead_snapshot.get("Fin_Dia"),
-                )
-                if not fecha_fin:
-                    out = "Ups, esa fecha no parece válida. Por favor escribe nuevamente el *DÍA* (1 a 31)."
-                    next_paso = "FIN_DIA"
-                else:
-                    update_lead_batch(ws_leads, leads_headers, lead_row, {"Fecha_Fin_Laboral": fecha_fin})
-                    next_paso = "SALARIO"  # ✅ FORZAR AVANCE
+    if estatus == "FIN_DIA":
+        if not re.match(r"^(3[01]|[12]\d|[1-9])$", incoming):
+            resp.message("Escribe un día del 1 al 31.")
+            return str(resp)
+        c = col_idx(hm, "Fin_Dia")
+        if c: ws.update_cell(lead_row, c, incoming)
+        resp.message("¿Cuál era tu salario mensual en MXN? (solo número, ej. 15000)")
+        ws.update_cell(lead_row, c_est, "SALARIO")
+        return str(resp)
 
-            # flujo normal para cualquier otro TEXTO
-            else:
-                next_paso = (cfg.get("Siguiente_Si_1") or paso_actual).strip()
-                if next_paso.upper() == "CORREO":
-                    next_paso = "DESCRIPCION"
+    if estatus == "SALARIO":
+        if not re.match(r"^\d{3,8}(\.\d{1,2})?$", incoming):
+            resp.message("Escribe un número válido (ej. 15000).")
+            return str(resp)
+        c_sal = col_idx(hm, "Salario_Mensual")
+        if c_sal: ws.update_cell(lead_row, c_sal, incoming)
 
-            # Responder texto del siguiente paso
-            if next_paso != paso_actual:
-                cfg2 = load_config_row(ws_config, next_paso)
-                out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
+        resp.message(
+            "Aviso importante: La información que te brindamos es orientativa y no constituye asesoría legal.\n\n"
+            "¿Deseas continuar?\n"
+            "1) Continuar\n"
+            "2) No deseo continuar"
+        )
+        ws.update_cell(lead_row, c_est, "DISCLAIMER")
+        return str(resp)
 
-    # ======================
-    # SISTEMA (solo texto)
-    # ======================
-    elif tipo == "SISTEMA":
-        # En este webhook, "SISTEMA" solo envía el texto configurado y actualiza estatus.
-        # Cálculos/resultados los hace el worker.
-        out = texto_bot or "Listo."
-        next_paso = (cfg.get("Siguiente_Si_1") or paso_actual).strip() or paso_actual
+    if estatus == "DISCLAIMER":
+        if incoming not in ("1", "2"):
+            resp.message("Responde con 1 o 2.")
+            return str(resp)
 
-    # update lead base
-    update_lead_batch(ws_leads, leads_headers, lead_row, {
-        "Ultima_Actualizacion": now_iso_mx(),
-        "ESTATUS": next_paso,
-        "Ultimo_Mensaje_Cliente": msg_in,
-        "Fuente_Lead": lead_snapshot.get("Fuente_Lead") or fuente,
-    })
+        if incoming == "2":
+            resp.message("Entendido. Si deseas retomar tu caso, escríbenos cuando gustes.")
+            ws.update_cell(lead_row, c_est, "FIN_NO_CONTINUA")
+            return str(resp)
 
-    # log
-    safe_log(ws_logs, {
-        "ID_Log": str(uuid.uuid4()),
-        "Fecha_Hora": now_iso_mx(),
-        "Telefono": from_phone_raw,
-        "ID_Lead": lead_id,
-        "Paso": next_paso,
-        "Mensaje_Entrante": msg_in,
-        "Mensaje_Saliente": out,
-        "Canal": canal,
-        "Fuente_Lead": lead_snapshot.get("Fuente_Lead") or fuente,
-        "Modelo_AI": modelo_ai,
-        "Errores": errores.strip(),
-    })
+        # 🔥🔥🔥 PASA A EN_PROCESO Y ENCOLA 1 JOB
+        ws.update_cell(lead_row, c_est, "EN_PROCESO")
 
-    return safe_reply(out)
+        encolado = enqueue_process_lead(lead_row, lead_id)
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+        resp.message(
+            "Gracias, ya tengo lo necesario ✅\n\n"
+            "Estoy preparando tu *estimación preliminar* y asignando a la abogada que llevará tu caso.\n"
+            "En un momento te envío el resultado por este medio."
+            + ("" if encolado else "\n\n(Ya estoy procesándolo, dame un momento 🙏)")
+        )
+        return str(resp)
+
+    # Si ya está procesado y quedó en CLIENTE_MENU:
+    if estatus == "CLIENTE_MENU":
+        resp.message(
+            "✅ Ya tengo tu estimación preliminar.\n\n"
+            "¿Qué deseas hacer?\n"
+            "1) Ver informe\n"
+            "2) Hablar con un abogado\n"
+            "3) Terminar"
+        )
+        return str(resp)
+
+    resp.message("Estoy en pruebas. Escribe 'Hola' para iniciar.")
+    return str(resp)
+
+@app.get("/")
+def health():
+    return "OK", 200
