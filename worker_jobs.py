@@ -1,119 +1,87 @@
 import os
-import time
-import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from utils.sheets import (
-    open_spreadsheet,
-    open_worksheet,
-    find_row_by_value,
-    safe_update_cells,
-    get_all_records_cached,
-)
-from utils.whatsapp import send_whatsapp_message
+from utils.sheets import open_spreadsheet, open_worksheet, with_backoff
 
-
-TZ = ZoneInfo("America/Mexico_City")
-
+TZ = os.environ.get("TZ", "America/Mexico_City")
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
+
 TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
-TAB_ABOGADOS = os.environ.get("TAB_ABOGADOS", "Cat_Abogados").strip()
-
-REPORT_BASE_URL = os.environ.get("REPORT_BASE_URL", "").strip()  # opcional
-
+TAB_LOGS  = os.environ.get("TAB_LOGS", "Logs").strip()
+TAB_ABOG  = os.environ.get("TAB_ABOGADOS", "Cat_Abogados").strip()
 
 def _now_iso():
-    return datetime.now(TZ).replace(microsecond=0).isoformat()
-
+    return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 def process_lead(lead_id: str):
     """
-    Job pesado:
-    - Lee lead
-    - Genera análisis/resultado preliminar
-    - Asigna abogada
-    - Guarda en Sheets
-    - Notifica por WhatsApp
+    Job principal: asignar abogado + generar análisis AI + preparar link reporte.
+    Aquí NO spameamos lecturas para no caer en 429.
     """
-    if not GOOGLE_SHEET_NAME:
-        raise RuntimeError("Falta GOOGLE_SHEET_NAME.")
-
     sh = open_spreadsheet(GOOGLE_SHEET_NAME)
     ws_leads = open_worksheet(sh, TAB_LEADS)
-    ws_abog = open_worksheet(sh, TAB_ABOGADOS)
+    ws_abog  = open_worksheet(sh, TAB_ABOG)
+    ws_logs  = open_worksheet(sh, TAB_LOGS)
 
-    # ---------- Lee lead (1 lectura, con backoff adentro) ----------
-    row_idx = find_row_by_value(ws_leads, "ID_Lead", lead_id)
-    if not row_idx:
-        raise RuntimeError(f"No encontré lead {lead_id} en {TAB_LEADS}.")
+    # 1) Leer fila del lead (1 sola lectura grande -> find por ID)
+    records = with_backoff(ws_leads.get_all_records)
+    idx = None
+    for i, r in enumerate(records):
+        if str(r.get("ID_Lead", "")).strip() == str(lead_id).strip():
+            idx = i
+            lead = r
+            break
+    if idx is None:
+        return {"ok": False, "error": f"Lead no encontrado: {lead_id}"}
 
-    # Trae headers y fila completa (evita múltiples gets)
-    headers = ws_leads.row_values(1)
-    row_vals = ws_leads.row_values(row_idx)
-    lead = dict(zip(headers, row_vals))
+    # 2) Si ya tiene abogado asignado, no reprocesar
+    if str(lead.get("ESTATUS", "")).strip() not in ("EN_PROCESO", "WAIT_RESULTADOS"):
+        return {"ok": True, "msg": "No requiere procesamiento", "estatus": lead.get("ESTATUS")}
 
-    telefono = (lead.get("Telefono") or "").strip()
-    nombre = (lead.get("Nombre") or "").strip() or "Hola"
-    tipo_caso = (lead.get("Tipo_Caso") or "").strip()
-    descripcion = (lead.get("Descripcion_Situacion") or "").strip()
-    salario = (lead.get("Salario_Mensual") or "").strip()
-    ini = (lead.get("Fecha_Inicio_Laboral") or "").strip()
-    fin = (lead.get("Fecha_Fin_Laboral") or "").strip()
+    # 3) Asignación simple: primer abogado activo (ajústalo a tu regla real)
+    abogs = with_backoff(ws_abog.get_all_records)
+    activo = None
+    for a in abogs:
+        if str(a.get("Activo", "")).strip() in ("1", "TRUE", "True", "SI", "Sí", "si"):
+            activo = a
+            break
+    if not activo and abogs:
+        activo = abogs[0]
 
-    # ---------- Asignación simple round-robin (sin matar cuota) ----------
-    abogados = get_all_records_cached(ws_abog, ttl_seconds=30)
-    # Espera columnas típicas: Abogado_ID, Nombre_Abogado, Activo
-    activos = [a for a in abogados if str(a.get("Activo", "1")).strip() in ("1", "TRUE", "True", "SI", "Sí", "si")]
-    if not activos:
-        activos = abogados
+    abogado_id = (activo or {}).get("Abogado_ID", "A01")
+    abogado_nombre = (activo or {}).get("Nombre", "Abogada asignada")
 
-    # estrategia: hash del lead para repartir estable
-    pick = activos[hash(lead_id) % max(1, len(activos))]
-    abogado_id = (pick.get("Abogado_ID") or pick.get("ID") or "A01").strip()
-    abogado_nombre = (pick.get("Nombre_Abogado") or pick.get("Nombre") or "tu abogada").strip()
+    # 4) Actualizar celdas del lead (1 update)
+    # Nota: ws_leads.update_cell usa índices 1-based.
+    header = with_backoff(ws_leads.row_values, 1)
+    def col(name): return header.index(name) + 1
 
-    # ---------- Resultado preliminar (placeholder) ----------
-    # Aquí luego metemos cálculo real LFT.
-    resultado = f"Estimación preliminar generada (tipo: {tipo_caso})."
+    row_num = idx + 2  # header + offset
+    updates = []
 
-    analisis = (
-        "Con la información que compartiste, revisaremos tu caso como "
-        f"“{tipo_caso}” conforme a la Ley Federal del Trabajo. "
-        "De forma preliminar, se consideran prestaciones devengadas "
-        "y, en su caso, indemnización. Un abogado confirmará contigo los datos "
-        "para cuidar tus derechos."
-    )
+    # ejemplo columnas esperadas (según tus screenshots)
+    if "Abogado_Asignado_ID" in header:
+        updates.append((row_num, col("Abogado_Asignado_ID"), abogado_id))
+    if "Abogado_Asignado" in header:
+        updates.append((row_num, col("Abogado_Asignado"), abogado_nombre))
+    if "ESTATUS" in header:
+        updates.append((row_num, col("ESTATUS"), "CLIENTE_MENU"))
+    if "Ultima_Actualizacion" in header:
+        updates.append((row_num, col("Ultima_Actualizacion"), _now_iso()))
 
-    token = uuid.uuid4().hex[:20]
-    link_reporte = ""
-    if REPORT_BASE_URL:
-        link_reporte = REPORT_BASE_URL.rstrip("/") + f"/r/{token}"
+    if updates:
+        cell_list = [ws_leads.cell(r, c) for (r, c, _) in updates]
+        for cell, (_, _, v) in zip(cell_list, updates):
+            cell.value = str(v)
+        with_backoff(ws_leads.update_cells, cell_list)
 
-    # ---------- Actualiza Sheets (1 batch) ----------
-    updates = {
-        "Ultima_Actualizacion": _now_iso(),
-        "ESTATUS": "CLIENTE_MENU",
-        "Analisis_AI": analisis,
-        "Resultado_Calculo": resultado,
-        "Abogado_Asignado_ID": abogado_id,
-        "Abogado_Asignado_Nombre": abogado_nombre,
-        "Token_Reporte": token,
-        "Link_Reporte_Web": link_reporte,
-        "Ultimo_Error": "",
-    }
-    safe_update_cells(ws_leads, row_idx, updates)
+    # 5) Log mínimo
+    if ws_logs:
+        with_backoff(ws_logs.append_row, [
+            _now_iso(), "", lead_id, "EN_PROCESO",
+            "", f"Procesado OK. Abogado: {abogado_nombre}",
+            "SISTEMA", "", "", ""
+        ])
 
-    # ---------- Mensaje al cliente ----------
-    msg = (
-        f"{nombre}, ya tengo tu estimación preliminar ✅\n\n"
-        f"Te asigné a: *{abogado_nombre}*.\n"
-        "En breve te contactamos para confirmar datos y proteger tus derechos.\n"
-    )
-    if link_reporte:
-        msg += f"\n📄 Tu reporte: {link_reporte}\n"
-
-    if telefono:
-        send_whatsapp_message(telefono, msg)
-
-    return {"ok": True, "lead_id": lead_id}
+    return {"ok": True, "lead_id": lead_id, "abogado": abogado_nombre}

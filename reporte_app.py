@@ -1,45 +1,28 @@
 import os
-from flask import Flask, request, abort
+from flask import Flask, jsonify, request
+from utils.sheets import open_spreadsheet, open_worksheet, with_backoff
 
-from utils.sheets import open_worksheet, find_row_by_value
-
+GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
 TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
 
 app = Flask(__name__)
 
 @app.get("/")
-def home():
-    return "Reporte OK"
+def health():
+    return jsonify({"ok": True, "service": "reporte"})
 
-@app.get("/r")
-def report():
-    token = (request.args.get("t") or "").strip()
-    if not token:
-        abort(400, "Falta token ?t=")
+@app.get("/reporte")
+def reporte():
+    lead_id = (request.args.get("lead_id") or "").strip()
+    if not lead_id:
+        return jsonify({"ok": False, "error": "Falta lead_id"}), 400
 
-    ws = open_worksheet(TAB_LEADS)
-    row = find_row_by_value(ws, "Token_Reporte", token)
-    if not row:
-        abort(404, "Token no encontrado")
+    sh = open_spreadsheet(GOOGLE_SHEET_NAME)
+    ws = open_worksheet(sh, TAB_LEADS)
+    rows = with_backoff(ws.get_all_records)
 
-    headers = ws.row_values(1)
-    values = ws.row_values(row)
-    data = {headers[i]: (values[i] if i < len(values) else "") for i in range(len(headers))}
+    for r in rows:
+        if str(r.get("ID_Lead", "")).strip() == lead_id:
+            return jsonify({"ok": True, "lead": r})
 
-    nombre = data.get("Nombre", "")
-    analisis = data.get("Analisis_AI", "")
-    resultado = data.get("Resultado_Calculo", "")
-
-    html = f"""
-    <html>
-      <head><meta charset="utf-8"><title>Reporte</title></head>
-      <body style="font-family: Arial; padding: 20px;">
-        <h2>Reporte preliminar</h2>
-        <p><b>Cliente:</b> {nombre}</p>
-        <p><b>Resultado cálculo:</b> {resultado}</p>
-        <h3>Análisis</h3>
-        <pre style="white-space: pre-wrap;">{analisis}</pre>
-      </body>
-    </html>
-    """
-    return html
+    return jsonify({"ok": False, "error": "Lead no encontrado"}), 404

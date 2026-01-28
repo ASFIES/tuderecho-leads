@@ -1,4 +1,6 @@
 import os
+import re
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -8,217 +10,213 @@ from twilio.twiml.messaging_response import MessagingResponse
 from redis import Redis
 from rq import Queue
 
-from utils.sheets import open_spreadsheet, open_worksheet, find_row_by_value, safe_update_cells, get_all_records_cached
+from utils.sheets import open_spreadsheet, open_worksheet, with_backoff
 
-TZ = ZoneInfo("America/Mexico_City")
+TZ = os.environ.get("TZ", "America/Mexico_City")
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
 TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
-TAB_CONFIG = os.environ.get("TAB_CONFIG", "Config_XimenaAI").strip()
+TAB_LOGS  = os.environ.get("TAB_LOGS", "Logs").strip()
+TAB_TEXT  = os.environ.get("TAB_TEXT", "Textos_Bot").strip()
+TAB_FLOW  = os.environ.get("TAB_FLOW", "Flow").strip()
 
-# ==========================================================
-#  SUNTUOSAMENTE AQUÍ VAN TUS 2 VARIABLES CLAVE DE REDIS 👑
-# ==========================================================
-REDIS_URL = os.environ.get("REDIS_URL", "").strip()          # <-- LINK REDIS (rediss://...)
-REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()  # <-- NOMBRE COLA (ximena)
+# =========================
+# 🔥 REDIS (AQUÍ SOLO SE LEE DE ENV)
+# =========================
+# ✅ En Render > Environment:
+#   REDIS_URL = redis://.... (link completo)
+#   REDIS_QUEUE_NAME = ximena
+REDIS_URL = os.environ.get("REDIS_URL", "redis://red-d5svi5v5r7bs73basen0:6379").strip()
+REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
 
 app = Flask(__name__)
 
 def _now_iso():
-    return datetime.now(TZ).replace(microsecond=0).isoformat()
+    return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%dT%H:%M:%S%z")
 
-def _norm_phone(from_field: str) -> str:
-    # Twilio trae: "whatsapp:+521..."
-    return (from_field or "").strip()
+def _normalize_phone(raw: str) -> str:
+    return re.sub(r"\D+", "", raw or "")
 
-def _norm_body(body: str) -> str:
-    return (body or "").strip()
+def _twiml(text: str):
+    resp = MessagingResponse()
+    resp.message(text)
+    return str(resp)
 
-def _load_config_steps(ws_config):
-    """
-    Espera Config_XimenaAI con columnas:
-    ID_Paso | Texto_Bot | Opciones_Validas (opcional)
-    """
-    rows = get_all_records_cached(ws_config, ttl_seconds=15)
-    by_id = {}
-    for r in rows:
-        pid = str(r.get("ID_Paso", "")).strip()
-        if pid:
-            by_id[pid] = r
-    return by_id
-
-def _get_text(step_cfg, nombre=""):
-    txt = str(step_cfg.get("Texto_Bot", "")).strip()
-    if nombre:
-        txt = txt.replace("{Nombre}", nombre)
-    return txt
-
-def _get_valid_options(step_cfg):
-    opts = str(step_cfg.get("Opciones_Validas", "")).strip()
-    if not opts:
+def _get_queue():
+    if not REDIS_URL:
         return None
-    return [o.strip() for o in opts.split(",") if o.strip()]
+    conn = Redis.from_url(REDIS_URL)
+    return Queue(REDIS_QUEUE_NAME, connection=conn)
 
-def _next_step(current_step: str, user_msg: str) -> str:
-    """
-    Reglas mínimas para tu flujo actual:
-    INICIO -> AVISO_PRIVACIDAD
-    AVISO_PRIVACIDAD (1/2) -> CASO_TIPO o FIN_NO_ACEPTA
-    CASO_TIPO -> CONFIRMACION_DATOS
-    CONFIRMACION_DATOS -> NOMBRE ...
-    DISCLAIMER (1 continuar) -> EN_PROCESO
-    EN_PROCESO -> (se queda, worker lo pasa a CLIENTE_MENU)
-    """
-    m = user_msg.strip()
+def _load_texts(ws_text):
+    rows = with_backoff(ws_text.get_all_records)
+    # Espera columnas: ID_Paso, Texto_Bot
+    out = {}
+    for r in rows:
+        k = str(r.get("ID_Paso", "")).strip()
+        v = str(r.get("Texto_Bot", "")).strip()
+        if k:
+            out[k] = v
+    return out
 
-    if current_step == "INICIO":
-        return "AVISO_PRIVACIDAD"
+def _load_flow(ws_flow):
+    rows = with_backoff(ws_flow.get_all_records)
+    # Espera columnas: ID_Paso, Tipo_Entrada, Opciones_Validas, Siguiente_Si_1, Siguiente_Si_2, Regla_Validacion, Mensaje_Error, Campo_BD_Leads_A_Actualizar
+    out = {}
+    for r in rows:
+        k = str(r.get("ID_Paso", "")).strip()
+        if k:
+            out[k] = r
+    return out
 
-    if current_step == "AVISO_PRIVACIDAD":
-        if m == "1":
-            return "CASO_TIPO"
-        if m == "2":
-            return "FIN_NO_ACEPTA"
-        return "AVISO_PRIVACIDAD"
+def _find_lead_row(ws_leads, lead_id: str):
+    records = with_backoff(ws_leads.get_all_records)
+    for i, r in enumerate(records):
+        if str(r.get("ID_Lead", "")).strip() == str(lead_id).strip():
+            return (i, r)  # idx 0-based + dict
+    return (None, None)
 
-    if current_step == "CASO_TIPO":
-        if m in ("1", "2"):
-            return "CONFIRMACION_DATOS"
-        return "CASO_TIPO"
+def _find_lead_by_phone(ws_leads, phone_norm: str):
+    records = with_backoff(ws_leads.get_all_records)
+    for i, r in enumerate(records):
+        if str(r.get("Telefono_Normalizado", "")).strip() == phone_norm:
+            return (i, r)
+    return (None, None)
 
-    if current_step == "CONFIRMACION_DATOS":
-        if m in ("1", "2"):
-            return "NOMBRE" if m == "1" else "FIN_NO_CONTINUA"
-        return "CONFIRMACION_DATOS"
+def _ensure_lead(ws_leads, from_phone: str):
+    phone_norm = _normalize_phone(from_phone)
+    idx, lead = _find_lead_by_phone(ws_leads, phone_norm)
+    if lead:
+        return idx, lead
 
-    # el resto lo manejas por tu tabla; aquí lo dejamos lineal:
-    order = ["NOMBRE","APELLIDO","DESCRIPCION","INI_ANIO","INI_MES","INI_DIA","FIN_ANIO","FIN_MES","FIN_DIA","SALARIO","DISCLAIMER"]
-    if current_step in order:
-        i = order.index(current_step)
-        if i < len(order)-1:
-            return order[i+1]
-        return "DISCLAIMER"
+    # Crear lead nuevo
+    lead_id = str(uuid.uuid4())[:8] + "-" + phone_norm[-6:]
+    header = with_backoff(ws_leads.row_values, 1)
 
-    if current_step == "DISCLAIMER":
-        if m == "1":
-            return "EN_PROCESO"
-        if m == "2":
-            return "FIN_NO_CONTINUA"
-        return "DISCLAIMER"
+    def col(name): return header.index(name) + 1
+    row = [""] * len(header)
 
-    if current_step in ("EN_PROCESO","CLIENTE_MENU","FIN_NO_CONTINUA","FIN_NO_ACEPTA"):
-        return current_step
+    def setv(name, val):
+        if name in header:
+            row[header.index(name)] = str(val)
 
-    return "INICIO"
+    setv("ID_Lead", lead_id)
+    setv("Telefono", from_phone)
+    setv("Telefono_Normalizado", phone_norm)
+    setv("Fuente_Lead", "DESCONOCIDA")
+    setv("Fecha_Registro", _now_iso())
+    setv("Ultima_Actualizacion", _now_iso())
+    setv("ESTATUS", "INICIO")
 
+    with_backoff(ws_leads.append_row, row, value_input_option="USER_ENTERED")
+
+    # Re-leer para devolver dict real
+    idx2, lead2 = _find_lead_by_phone(ws_leads, phone_norm)
+    return idx2, lead2
+
+def _update_lead_cells(ws_leads, row_num_1based: int, updates: dict):
+    header = with_backoff(ws_leads.row_values, 1)
+    cell_list = []
+    for k, v in updates.items():
+        if k in header:
+            c = header.index(k) + 1
+            cell = ws_leads.cell(row_num_1based, c)
+            cell.value = str(v)
+            cell_list.append(cell)
+    if cell_list:
+        with_backoff(ws_leads.update_cells, cell_list)
+
+def _log(ws_logs, lead_id: str, paso: str, msg_in: str, msg_out: str, err: str = ""):
+    with_backoff(ws_logs.append_row, [
+        _now_iso(), "", "", lead_id, paso, msg_in, msg_out,
+        "WHATSAPP", "DESCONOCIDA", "gpt-4o-mini", err
+    ])
 
 @app.post("/whatsapp")
 def whatsapp_webhook():
-    if not GOOGLE_SHEET_NAME:
-        resp = MessagingResponse()
-        resp.message("Error interno: falta GOOGLE_SHEET_NAME.")
-        return str(resp)
+    msg_in = (request.form.get("Body") or "").strip()
+    from_phone = request.form.get("From") or ""
 
-    from_ = _norm_phone(request.form.get("From"))
-    body = _norm_body(request.form.get("Body"))
+    try:
+        sh = open_spreadsheet(GOOGLE_SHEET_NAME)
+        ws_leads = open_worksheet(sh, TAB_LEADS)
+        ws_logs  = open_worksheet(sh, TAB_LOGS)
+        ws_text  = open_worksheet(sh, TAB_TEXT)
+        ws_flow  = open_worksheet(sh, TAB_FLOW)
 
-    sh = open_spreadsheet(GOOGLE_SHEET_NAME)
-    ws_leads = open_worksheet(sh, TAB_LEADS)
-    ws_cfg = open_worksheet(sh, TAB_CONFIG)
+        texts = _load_texts(ws_text)
+        flow  = _load_flow(ws_flow)
 
-    cfg = _load_config_steps(ws_cfg)
+        idx, lead = _ensure_lead(ws_leads, from_phone)
+        if not lead:
+            return _twiml("Por el momento no pude acceder a la base de datos. Intenta nuevamente en unos minutos.")
 
-    # -------- upsert lead por Telefono (o Telefono_Normalizado) --------
-    lead_row = find_row_by_value(ws_leads, "Telefono", from_)
-    if not lead_row:
-        # crea nuevo lead: aquí lo mínimo (asumiendo headers ya existen)
-        # Para simplificar sin añadir más lecturas: buscamos última fila y append
-        headers = ws_leads.row_values(1)
-        new = {h: "" for h in headers}
-        new["ID_Lead"] = from_.replace("whatsapp:", "").replace("+", "")
-        new["Telefono"] = from_
-        new["Fuente_Lead"] = "DESCONOCIDA"
-        new["Fecha_Registro"] = _now_iso()
-        new["Ultima_Actualizacion"] = _now_iso()
-        new["ESTATUS"] = "INICIO"
+        lead_id = lead.get("ID_Lead")
+        estatus = (lead.get("ESTATUS") or "INICIO").strip()
+        row_num = (idx + 2)  # 1-based real row
 
-        ws_leads.append_row([new.get(h,"") for h in headers], value_input_option="USER_ENTERED")
-        lead_row = find_row_by_value(ws_leads, "Telefono", from_)
+        # =========================
+        # ✅ REGLA CLAVE: SI ES NUEVO O ESTÁ EN INICIO, PRIMERO MUESTRA INICIO
+        # NO VALIDES "Hola" COMO OPCIÓN.
+        # =========================
+        if estatus == "INICIO":
+            out = texts.get("INICIO", "Hola, soy Ximena. ¿Deseas continuar?\n1 Sí\n2 No")
+            _update_lead_cells(ws_leads, row_num, {"Ultima_Actualizacion": _now_iso()})
+            _log(ws_logs, lead_id, "INICIO", msg_in, out)
+            return _twiml(out)
 
-    # Lee estatus actual
-    headers = ws_leads.row_values(1)
-    row_vals = ws_leads.row_values(lead_row)
-    lead = dict(zip(headers, row_vals))
+        # Flujo normal
+        step = flow.get(estatus, {})
+        tipo = str(step.get("Tipo_Entrada", "")).strip().upper()
+        opciones = str(step.get("Opciones_Validas", "")).strip()
+        err_msg = str(step.get("Mensaje_Error", "Por favor responde con una opción válida (ej. 1 o 2).")).strip()
 
-    current = (lead.get("ESTATUS") or "INICIO").strip() or "INICIO"
-    nombre = (lead.get("Nombre") or "").strip()
+        # Validación mínima de opciones
+        if tipo == "OPCIONES":
+            valid = [x.strip() for x in opciones.split(",") if x.strip()]
+            if msg_in not in valid:
+                _log(ws_logs, lead_id, estatus, msg_in, err_msg)
+                return _twiml(err_msg)
 
-    # -------- valida opciones si aplica --------
-    step_cfg = cfg.get(current, {})
-    valid = _get_valid_options(step_cfg)
-    if valid is not None:
-        if body not in valid:
-            r = MessagingResponse()
-            r.message("Por favor responde con una opción válida (ej. 1 o 2).")
-            return str(r)
+            # calcular siguiente paso
+            next_step = step.get("Siguiente_Si_1") if msg_in == "1" else step.get("Siguiente_Si_2")
+            next_step = str(next_step or "").strip() or "INICIO"
 
-    # -------- guarda dato del paso (si corresponde a una columna) --------
-    # Mapeo simple; si ya lo tienes en Sheets por tabla, luego lo conectamos.
-    step_to_col = {
-        "NOMBRE": "Nombre",
-        "APELLIDO": "Apellido",
-        "DESCRIPCION": "Descripcion_Situacion",
-        "SALARIO": "Salario_Mensual",
-        # fecha la reconstruyes tú (aquí ejemplo rápido):
-        "INI_ANIO": "Inicio_Anio",
-        "INI_MES": "Inicio_Mes",
-        "INI_DIA": "Inicio_Dia",
-        "FIN_ANIO": "Fin_Anio",
-        "FIN_MES": "Fin_Mes",
-        "FIN_DIA": "Fin_Dia",
-        "CASO_TIPO": "Tipo_Caso",
-        "AVISO_PRIVACIDAD": "Aviso_Privacidad_Aceptado",
-    }
+            # actualizar campo si aplica
+            campo = str(step.get("Campo_BD_Leads_A_Actualizar", "")).strip()
+            updates = {"ESTATUS": next_step, "Ultima_Actualizacion": _now_iso()}
+            if campo:
+                updates[campo] = msg_in
 
-    updates = {"Ultima_Actualizacion": _now_iso()}
-    col = step_to_col.get(current)
-    if col:
-        updates[col] = body
+            _update_lead_cells(ws_leads, row_num, updates)
 
-    # next step
-    nxt = _next_step(current, body)
-    updates["ESTATUS"] = nxt
+            # responder con texto del siguiente paso
+            out = texts.get(next_step, "Continuemos…")
+            _log(ws_logs, lead_id, next_step, msg_in, out)
+            return _twiml(out)
 
-    safe_update_cells(ws_leads, lead_row, updates)
+        # Texto libre (ej. NOMBRE, APELLIDO, DESCRIPCION, etc.)
+        next_step = str(step.get("Siguiente_Si_1") or "").strip() or estatus
+        campo = str(step.get("Campo_BD_Leads_A_Actualizar", "")).strip()
 
-    # -------- responder al usuario --------
-    resp = MessagingResponse()
+        updates = {"ESTATUS": next_step, "Ultima_Actualizacion": _now_iso()}
+        if campo:
+            updates[campo] = msg_in
 
-    # si pasamos a EN_PROCESO, encolamos job y damos mensaje bonito
-    if nxt == "EN_PROCESO":
-        # cola redis
-        if not REDIS_URL:
-            resp.message("Error interno: falta REDIS_URL.")
-            return str(resp)
+        _update_lead_cells(ws_leads, row_num, updates)
 
-        lead_id = lead.get("ID_Lead") or from_.replace("whatsapp:", "")
-        redis_conn = Redis.from_url(REDIS_URL)
-        q = Queue(REDIS_QUEUE_NAME, connection=redis_conn)
+        out = texts.get(next_step, "Gracias. Continuemos…")
 
-        from worker_jobs import process_lead
-        q.enqueue(process_lead, lead_id, job_timeout=180)
+        # Si caíste en EN_PROCESO, manda job a Redis
+        if next_step == "EN_PROCESO":
+            q = _get_queue()
+            if q is not None:
+                from worker_jobs import process_lead
+                q.enqueue(process_lead, lead_id, job_timeout=120)
 
-        resp.message(
-            "Gracias, ya tengo lo necesario ✅\n\n"
-            "Estoy preparando tu estimación preliminar y asignando a la abogada que llevará tu caso.\n"
-            "En un momento te envío el resultado por este medio."
-        )
-        return str(resp)
+        _log(ws_logs, lead_id, next_step, msg_in, out)
+        return _twiml(out)
 
-    # texto del siguiente paso
-    next_cfg = cfg.get(nxt, {})
-    msg = _get_text(next_cfg, nombre=nombre)
-    if not msg:
-        msg = "Perfecto. Continuemos."
-    resp.message(msg)
-    return str(resp)
+    except Exception as e:
+        # fallback
+        return _twiml("Por el momento no pude acceder a la base de datos. Intenta de nuevo en unos minutos.")
