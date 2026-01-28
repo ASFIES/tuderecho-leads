@@ -9,7 +9,11 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
 
 
 def _sleep_backoff(attempt: int):
