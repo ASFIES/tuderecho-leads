@@ -10,30 +10,15 @@ from zoneinfo import ZoneInfo
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Redis / RQ
 from redis import Redis
 from rq import Queue
 
-from utils.sheets import (
-    get_gspread_client,
-    open_spreadsheet,
-    open_worksheet,
-    build_header_map,
-    col_idx,
-    find_row_by_value,
-    update_lead_batch,
-    safe_log,
-)
-from utils.flow import load_config_row, pick_next_step_from_option
-from utils.text import (
-    render_text,
-    phone_raw,
-    phone_norm,
-    normalize_msg,
-    normalize_option,
-    detect_fuente,
-    is_valid_by_rule,
-    build_date_from_parts,
-)
+# Job module
+import worker_jobs
 
 # =========================
 # App
@@ -48,38 +33,89 @@ GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
 TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
 TAB_CONFIG = os.environ.get("TAB_CONFIG", "Config_XimenaAI").strip()
 TAB_LOGS = os.environ.get("TAB_LOGS", "Logs").strip()
-TAB_SYS = os.environ.get("TAB_SYS", "Config_Sistema").strip()  # (lo usa worker)
-TAB_PARAM = os.environ.get("TAB_PARAM", "Parametros_Legales").strip()  # (lo usa worker)
-TAB_ABOGADOS = os.environ.get("TAB_ABOGADOS", "Cat_Abogados").strip()  # (lo usa worker)
-TAB_CONOC = os.environ.get("TAB_CONOC", "Conocimiento_AI").strip()  # (lo usa worker)
 
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
 GOOGLE_CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "").strip()
 
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
-
-# Redis / RQ
+# Redis env (ya los tienes)
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
 
+# =========================
+# Time (MX)
+# =========================
 MX_TZ = ZoneInfo("America/Mexico_City")
 
 def now_iso_mx():
     return datetime.now(MX_TZ).isoformat(timespec="seconds")
 
+# =========================
+# Twilio Reply
+# =========================
 def safe_reply(text: str):
     resp = MessagingResponse()
     resp.message(text)
     return str(resp)
 
-def get_queue():
-    if not REDIS_URL:
-        raise RuntimeError("Falta REDIS_URL en variables de entorno.")
-    r = Redis.from_url(REDIS_URL)
-    return Queue(REDIS_QUEUE_NAME, connection=r, default_timeout=180)
+def render_text(s: str) -> str:
+    s = s or ""
+    return s.replace("\\n", "\n")
 
 # =========================
-# Google creds
+# Normalización
+# =========================
+def phone_raw(raw: str) -> str:
+    return (raw or "").strip()
+
+def phone_norm(raw: str) -> str:
+    s = (raw or "").strip()
+    s = s.replace("whatsapp:", "").strip()
+    return s
+
+def normalize_msg(s: str) -> str:
+    s = (s or "").strip()
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def normalize_option(s: str) -> str:
+    s = normalize_msg(s)
+    m = re.search(r"\d", s)
+    if m:
+        return m.group(0)
+    return s
+
+# =========================
+# Fuente Lead
+# =========================
+def detect_fuente(msg: str) -> str:
+    t = (msg or "").lower()
+    if "facebook" in t or "anuncio" in t or "fb" in t:
+        return "FACEBOOK"
+    if "sitio" in t or "web" in t or "pagina" in t or "página" in t:
+        return "WEB"
+    return "DESCONOCIDA"
+
+# =========================
+# Redis queue
+# =========================
+def get_rq_queue():
+    if not REDIS_URL:
+        raise RuntimeError("Falta REDIS_URL en el servicio Webhook.")
+    conn = Redis.from_url(REDIS_URL)
+    return Queue(REDIS_QUEUE_NAME, connection=conn)
+
+def enqueue_process_lead(lead_id: str):
+    """
+    Encola worker_jobs.process_lead(lead_id) en RQ.
+    """
+    q = get_rq_queue()
+    # job_timeout: segundos máximos permitidos para ejecutar el cálculo
+    q.enqueue(worker_jobs.process_lead, lead_id, job_timeout=180)
+
+# =========================
+# Google creds + gspread
 # =========================
 def get_env_creds_dict():
     if GOOGLE_CREDENTIALS_JSON:
@@ -100,8 +136,119 @@ def get_env_creds_dict():
 
     raise RuntimeError("Faltan credenciales: usa GOOGLE_CREDENTIALS_JSON o GOOGLE_CREDENTIALS_PATH.")
 
+def get_gspread_client():
+    creds_info = get_env_creds_dict()
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def open_spreadsheet(gc):
+    if not GOOGLE_SHEET_NAME:
+        raise RuntimeError("Falta GOOGLE_SHEET_NAME.")
+    return gc.open(GOOGLE_SHEET_NAME)
+
+def open_worksheet(sh, title: str):
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        raise RuntimeError(f"No existe la pestaña '{title}' en el Google Sheet '{GOOGLE_SHEET_NAME}'.")
+
 # =========================
-# Lead: get/create
+# Headers / Sheet utils
+# =========================
+def build_header_map(ws):
+    headers = ws.row_values(1)
+    m = {}
+    for i, h in enumerate(headers, start=1):
+        key = (h or "").strip()
+        if not key:
+            continue
+        if key not in m:
+            m[key] = i
+        low = key.lower()
+        if low not in m:
+            m[low] = i
+    return m
+
+def col_idx(headers_map: dict, name: str):
+    return headers_map.get(name) or headers_map.get((name or "").lower())
+
+def find_row_by_value(ws, col_idx_num: int, value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    col_values = ws.col_values(col_idx_num)
+    for i, v in enumerate(col_values[1:], start=2):
+        if (v or "").strip() == value:
+            return i
+    return None
+
+def update_cells_batch(ws, updates_a1_to_value: dict):
+    payload = [{"range": a1, "values": [[val]]} for a1, val in updates_a1_to_value.items()]
+    if payload:
+        ws.batch_update(payload)
+
+def update_lead_batch(ws, header_map: dict, row_idx: int, updates: dict):
+    to_send = {}
+    for col_name, val in (updates or {}).items():
+        idx = col_idx(header_map, col_name)
+        if not idx:
+            continue
+        a1 = gspread.utils.rowcol_to_a1(row_idx, idx)
+        to_send[a1] = val
+    update_cells_batch(ws, to_send)
+
+def safe_log(ws_logs, data: dict):
+    try:
+        cols = [
+            "ID_Log", "Fecha_Hora", "Telefono", "ID_Lead", "Paso",
+            "Mensaje_Entrante", "Mensaje_Saliente",
+            "Canal", "Fuente_Lead", "Modelo_AI", "Errores"
+        ]
+        row = [data.get(c, "") for c in cols]
+        ws_logs.append_row(row, value_input_option="USER_ENTERED")
+    except Exception:
+        pass
+
+# =========================
+# Load Config row
+# =========================
+def load_config_row(ws_config, paso_actual: str):
+    cfg_headers = build_header_map(ws_config)
+    idpaso_col = col_idx(cfg_headers, "ID_Paso")
+    if not idpaso_col:
+        raise RuntimeError("En Config_XimenaAI falta la columna 'ID_Paso'.")
+
+    paso_actual = (paso_actual or "").strip() or "INICIO"
+    row = find_row_by_value(ws_config, idpaso_col, paso_actual)
+    if not row and paso_actual != "INICIO":
+        row = find_row_by_value(ws_config, idpaso_col, "INICIO")
+    if not row:
+        raise RuntimeError(f"No existe configuración para el paso '{paso_actual}'.")
+
+    row_vals = ws_config.row_values(row)
+
+    base_fields = [
+        "ID_Paso", "Texto_Bot", "Tipo_Entrada", "Opciones_Validas",
+        "Siguiente_Si_1", "Siguiente_Si_2",
+        "Campo_BD_Leads_A_Actualizar", "Regla_Validacion", "Mensaje_Error"
+    ]
+    extra_siguientes = [f"Siguiente_Si_{i}" for i in range(3, 10)]
+
+    def get_field(name):
+        idx = col_idx(cfg_headers, name)
+        return (row_vals[idx-1] if idx and idx-1 < len(row_vals) else "").strip()
+
+    out = {k: get_field(k) for k in base_fields}
+    for k in extra_siguientes:
+        out[k] = get_field(k)
+    return out
+
+# =========================
+# Leads: get/create
 # =========================
 def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_normed: str, fuente: str):
     tel_col = col_idx(leads_headers, "Telefono")
@@ -146,6 +293,60 @@ def get_or_create_lead(ws_leads, leads_headers: dict, tel_raw: str, tel_normed: 
     return row, lead_id, "INICIO", True
 
 # =========================
+# Validations
+# =========================
+def is_valid_by_rule(value: str, rule: str) -> bool:
+    value = (value or "").strip()
+    rule = (rule or "").strip()
+    if not rule:
+        return True
+
+    if rule.startswith("REGEX:"):
+        pattern = rule.replace("REGEX:", "", 1).strip()
+        try:
+            return re.match(pattern, value) is not None
+        except:
+            return False
+
+    if rule == "MONEY":
+        try:
+            x = float(value.replace("$", "").replace(",", "").strip())
+            return x >= 0
+        except:
+            return False
+
+    return True
+
+# =========================
+# Build date from parts
+# =========================
+def build_date_from_parts(y: str, m: str, d: str) -> str:
+    y = (y or "").strip()
+    m = (m or "").strip()
+    d = (d or "").strip()
+    if not (y and m and d):
+        return ""
+    try:
+        yy = int(y); mm = int(m); dd = int(d)
+        dt = datetime(yy, mm, dd)
+        return dt.strftime("%Y-%m-%d")
+    except:
+        return ""
+
+# =========================
+# Next step helper (OPCIONES)
+# =========================
+def pick_next_step_from_option(cfg: dict, msg_opt: str, default_step: str):
+    k = f"Siguiente_Si_{msg_opt}"
+    if cfg.get(k):
+        return cfg.get(k).strip()
+    if msg_opt == "1" and cfg.get("Siguiente_Si_1"):
+        return cfg.get("Siguiente_Si_1").strip()
+    if msg_opt == "2" and cfg.get("Siguiente_Si_2"):
+        return cfg.get("Siguiente_Si_2").strip()
+    return default_step
+
+# =========================
 # Routes
 # =========================
 @app.get("/")
@@ -162,7 +363,7 @@ def whatsapp_webhook():
     msg_opt = normalize_option(body_raw)
 
     canal = "WHATSAPP"
-    modelo_ai = OPENAI_MODEL  # solo para log
+    modelo_ai = ""  # aquí ya no usamos OpenAI en webhook
 
     if not msg_in:
         return safe_reply("Hola 👋")
@@ -170,8 +371,8 @@ def whatsapp_webhook():
     fuente = detect_fuente(msg_in)
 
     try:
-        gc = get_gspread_client(get_env_creds_dict())
-        sh = open_spreadsheet(gc, GOOGLE_SHEET_NAME)
+        gc = get_gspread_client()
+        sh = open_spreadsheet(gc)
         ws_leads = open_worksheet(sh, TAB_LEADS)
         ws_config = open_worksheet(sh, TAB_CONFIG)
         ws_logs = open_worksheet(sh, TAB_LOGS)
@@ -184,13 +385,13 @@ def whatsapp_webhook():
         ws_leads, leads_headers, from_phone_raw, from_phone_normed, fuente
     )
 
-    row_vals = ws_leads.row_values(lead_row)
     headers_list = ws_leads.row_values(1)
+    row_vals = ws_leads.row_values(lead_row)
     lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
 
     errores = ""
 
-    # Si es nuevo, saluda con INICIO y ya
+    # ========== NEW LEAD ==========
     if created:
         cfg_inicio = load_config_row(ws_config, "INICIO")
         out = render_text(cfg_inicio.get("Texto_Bot") or "Hola, soy Ximena AI 👋")
@@ -215,7 +416,7 @@ def whatsapp_webhook():
         })
         return safe_reply(out)
 
-    # Fail-safe: saltar CORREO si existiera
+    # Fail-safe: saltar CORREO si existiera por error
     if (estatus_actual or "").strip().upper() == "CORREO":
         estatus_actual = "DESCRIPCION"
 
@@ -245,43 +446,28 @@ def whatsapp_webhook():
             out = (texto_bot + "\n\n" if texto_bot else "") + msg_error
             next_paso = paso_actual
         else:
-            # Nunca guardar correo
+            # Guardar en BD si aplica (nunca correo)
             if campo_update and campo_update.lower() != "correo":
                 update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_opt})
 
+            # Determinar siguiente paso
             next_paso = pick_next_step_from_option(cfg, msg_opt, paso_actual)
+
+            # Salto forzado si por error apunta a CORREO
             if next_paso.upper() == "CORREO":
                 next_paso = "DESCRIPCION"
 
-            # Si el siguiente paso es GENERAR_RESULTADOS, encolamos y respondemos rápido
-            if next_paso.upper() == "GENERAR_RESULTADOS":
+            # Cargar cfg del siguiente paso
+            cfg2 = load_config_row(ws_config, next_paso)
+
+            # ✅ Caso especial: EN_PROCESO => encolar job y responder texto
+            if next_paso.strip().upper() == "EN_PROCESO":
                 try:
-                    # Marcamos que estamos esperando resultados
-                    update_lead_batch(ws_leads, leads_headers, lead_row, {
-                        "ESTATUS": "WAIT_RESULTADOS",
-                        "Ultima_Actualizacion": now_iso_mx(),
-                    })
-                    q = get_queue()
-                    q.enqueue(
-                        "worker_jobs.process_resultados",
-                        {
-                            "telefono_raw": from_phone_raw,
-                            "telefono_norm": from_phone_normed,
-                            "lead_id": lead_id,
-                        }
-                    )
-                    out = (
-                        "Gracias, ya tengo lo necesario ✅\n\n"
-                        "Estoy preparando tu *estimación preliminar* y asignando a la abogada que llevará tu caso.\n"
-                        "En un momento te envío el resultado por este mismo medio."
-                    )
-                    next_paso = "WAIT_RESULTADOS"
+                    enqueue_process_lead(lead_id)
                 except Exception as e:
                     errores += f"Enqueue_Err: {e}. "
-                    out = "⚠️ Por el momento no pude generar tus resultados. Intenta de nuevo en unos minutos."
-                    next_paso = paso_actual
+                out = render_text(cfg2.get("Texto_Bot") or "Gracias. Estoy preparando tu estimación…")
             else:
-                cfg2 = load_config_row(ws_config, next_paso)
                 out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
 
     # ======================
@@ -296,11 +482,11 @@ def whatsapp_webhook():
             if campo_update and campo_update.lower() != "correo":
                 update_lead_batch(ws_leads, leads_headers, lead_row, {campo_update: msg_in})
 
-            # refrescar snapshot para fechas
+            # refrescar snapshot
             row_vals = ws_leads.row_values(lead_row)
             lead_snapshot = {h: (row_vals[i] if i < len(row_vals) else "") or "" for i, h in enumerate(headers_list)}
 
-            # INI_DIA: construir fecha inicio y avanzar
+            # ----- FIX: INI_DIA debe avanzar -----
             if paso_actual.upper() == "INI_DIA":
                 fecha_ini = build_date_from_parts(
                     lead_snapshot.get("Inicio_Anio"),
@@ -312,9 +498,9 @@ def whatsapp_webhook():
                     next_paso = "INI_DIA"
                 else:
                     update_lead_batch(ws_leads, leads_headers, lead_row, {"Fecha_Inicio_Laboral": fecha_ini})
-                    next_paso = "FIN_ANIO"
+                    next_paso = "FIN_ANIO"  # ✅ FORZAR AVANCE
 
-            # FIN_DIA: construir fecha fin y avanzar
+            # ----- FIX: FIN_DIA debe avanzar -----
             elif paso_actual.upper() == "FIN_DIA":
                 fecha_fin = build_date_from_parts(
                     lead_snapshot.get("Fin_Anio"),
@@ -326,24 +512,29 @@ def whatsapp_webhook():
                     next_paso = "FIN_DIA"
                 else:
                     update_lead_batch(ws_leads, leads_headers, lead_row, {"Fecha_Fin_Laboral": fecha_fin})
-                    next_paso = "SALARIO"
+                    next_paso = "SALARIO"  # ✅ FORZAR AVANCE
+
+            # flujo normal para cualquier otro TEXTO
             else:
                 next_paso = (cfg.get("Siguiente_Si_1") or paso_actual).strip()
                 if next_paso.upper() == "CORREO":
                     next_paso = "DESCRIPCION"
 
+            # Responder texto del siguiente paso
             if next_paso != paso_actual:
                 cfg2 = load_config_row(ws_config, next_paso)
                 out = render_text(cfg2.get("Texto_Bot") or "Gracias.")
 
     # ======================
-    # SISTEMA (en main no ejecutamos procesos pesados)
+    # SISTEMA (solo texto)
     # ======================
-    else:
-        # Mantener robustez: si cae aquí, devolvemos texto del paso actual
-        out = texto_bot or "Gracias."
+    elif tipo == "SISTEMA":
+        # En este webhook, "SISTEMA" solo envía el texto configurado y actualiza estatus.
+        # Cálculos/resultados los hace el worker.
+        out = texto_bot or "Listo."
+        next_paso = (cfg.get("Siguiente_Si_1") or paso_actual).strip() or paso_actual
 
-    # update base lead
+    # update lead base
     update_lead_batch(ws_leads, leads_headers, lead_row, {
         "Ultima_Actualizacion": now_iso_mx(),
         "ESTATUS": next_paso,
