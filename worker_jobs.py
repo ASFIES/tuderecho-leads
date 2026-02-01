@@ -1,240 +1,178 @@
 import os
-import uuid
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
-from utils.sheets import (
-    open_spreadsheet,
-    open_worksheet,
-    get_all_values_safe,
-    header_map,
-    row_to_dict,
-    find_row_by_col_value,
-    update_row_cells,
-    with_backoff,
-)
-from utils.abogados import list_abogados, pick_abogado, incrementar_carga
-from utils.ai import generate_ai_summary
-from utils.whatsapp import send_whatsapp_message
+from twilio.rest import Client
 
-TZ = os.environ.get("TZ", "America/Mexico_City").strip()
-MX_TZ = ZoneInfo(TZ)
+from utils.sheets import open_spreadsheet, open_worksheet, with_backoff, build_header_map, col_idx, find_row_by_value, update_row_cells
+
+MX_TZ = ZoneInfo(os.environ.get("TZ", "America/Mexico_City"))
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
 TAB_LEADS = os.environ.get("TAB_LEADS", "BD_Leads").strip()
-TAB_ABOGADOS = os.environ.get("TAB_ABOGADOS", "Cat_Abogados").strip()
-TAB_SYS = os.environ.get("TAB_SYS", "Config_Sistema").strip()
-TAB_GESTION = os.environ.get("TAB_GESTION_ABOGADOS", "Gestion_Abogados").strip()
+TAB_ABOG  = os.environ.get("TAB_ABOGADOS", "Cat_Abogados").strip()
 
-def now_iso() -> str:
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+WHATSAPP_NUMBER    = os.environ.get("WHATSAPP_NUMBER", "").strip()  # whatsapp:+1415...
+
+def now_iso():
     return datetime.now(MX_TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
 
-def _to_int(x, default=0):
+def _wa_to(to_raw: str) -> str:
+    t = (to_raw or "").strip()
+    return t if t.startswith("whatsapp:") else "whatsapp:" + t
+
+def send_whatsapp(to_number: str, body: str):
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and WHATSAPP_NUMBER):
+        raise RuntimeError("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / WHATSAPP_NUMBER.")
+    c = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    c.messages.create(from_=WHATSAPP_NUMBER, to=_wa_to(to_number), body=body)
+
+def money_to_float(s: str) -> float:
     try:
-        return int(float(str(x).strip()))
-    except Exception:
-        return default
+        return float(str(s).replace("$", "").replace(",", "").strip() or "0")
+    except:
+        return 0.0
 
-def _to_float(x, default=0.0):
+def safe_int(s: str) -> int:
     try:
-        s = str(x).strip().replace(",", "")
-        return float(s)
-    except Exception:
-        return default
+        return int(str(s).strip())
+    except:
+        return 0
 
-def _build_date(yy, mm, dd) -> date | None:
-    y = _to_int(yy, 0); m = _to_int(mm, 0); d = _to_int(dd, 0)
-    if y <= 0 or m <= 0 or d <= 0:
-        return None
-    try:
-        return date(y, m, d)
-    except Exception:
-        return None
+def pick_abogado(ws_abog, salario_mensual: float):
+    """
+    Regla:
+      salario >= 50000 => ID_Abogado A01 (si está activo).
+      si no, primer activo.
+    """
+    h = build_header_map(ws_abog)
+    rows = with_backoff(ws_abog.get_all_values)
+    if not rows or len(rows) < 2:
+        return ("A01", "Abogada asignada", "")
 
-def _tipo_caso_humano(tipo: str) -> str:
-    t = (tipo or "").strip()
-    if t == "1": return "Despido"
-    if t == "2": return "Renuncia"
-    return "Caso laboral"
+    def get_cell(r, name):
+        c = col_idx(h, name)
+        return (r[c-1] if c and c-1 < len(r) else "").strip()
 
-def calcular_estimacion(tipo_caso: str, salario_mensual: float, f_ini: date | None, f_fin: date | None) -> dict:
-    sd = salario_mensual / 30.0 if salario_mensual > 0 else 0.0
+    # 1) A01 si salario >= 50k
+    if salario_mensual >= 50000:
+        for r in rows[1:]:
+            if get_cell(r, "ID_Abogado") == "A01":
+                activo = get_cell(r, "Activo").upper()
+                if activo in ("SI", "SÍ", "TRUE", "1"):
+                    return ("A01", get_cell(r, "Nombre_Abogado") or "Abogada A01", get_cell(r, "Telefono_Abogado"))
 
-    dias = None
-    anios = None
-    if f_ini and f_fin:
-        dias = (f_fin - f_ini).days + 1
-        anios = max(dias / 365.0, 0.0)
+    # 2) primer activo
+    for r in rows[1:]:
+        aid = get_cell(r, "ID_Abogado")
+        if not aid:
+            continue
+        activo = get_cell(r, "Activo").upper() or "SI"
+        if activo in ("SI", "SÍ", "TRUE", "1"):
+            return (aid, get_cell(r, "Nombre_Abogado") or f"Abogada {aid}", get_cell(r, "Telefono_Abogado"))
 
-    aguinaldo_dias = 15.0
-    aguinaldo_prop = 0.0
-    if dias is not None:
-        aguinaldo_prop = sd * aguinaldo_dias * (dias / 365.0)
+    return ("A01", "Abogada asignada", "")
 
-    base = {
-        "salario_diario": sd,
-        "dias_trabajados": dias,
-        "anios_aprox": anios,
-        "aguinaldo_proporcional": aguinaldo_prop,
-    }
+def build_resumen(tipo_caso: str, nombre: str) -> str:
+    # más humano + base legal general (sin prometer)
+    if str(tipo_caso).strip() == "1":
+        return (
+            f"{nombre}, lamento mucho que estés pasando por esto. No estás solo/a: te acompañaremos paso a paso.\n\n"
+            "En casos de despido, la Ley Federal del Trabajo prevé que el patrón debe acreditar una causa (art. 47) "
+            "y, si no lo hace, puede proceder indemnización o reinstalación (art. 48), además de prestaciones pendientes.\n\n"
+            "Esta es una estimación preliminar e informativa. Una abogada revisará tu caso y te orientará con precisión."
+        )
+    return (
+        f"{nombre}, gracias por confiar en nosotros. Entiendo que este tipo de cierre laboral puede ser pesado.\n\n"
+        "En renuncia normalmente corresponde finiquito (proporcionales de aguinaldo, vacaciones, prima vacacional y pagos pendientes). "
+        "Esta es información preliminar; una abogada revisará tu situación para darte claridad y acompañarte."
+    )
 
-    if tipo_caso == "1":
-        ind_90 = sd * 90.0
-        veinte = (sd * 20.0 * anios) if anios is not None else 0.0
-        total = ind_90 + veinte + aguinaldo_prop
-        base.update({
-            "indemnizacion_90_dias": ind_90,
-            "veinte_dias_por_anio": veinte,
-            "total_estimado": total,
-        })
-        return base
+def calc_estimacion_simple(tipo_caso: str, salario_mensual: float, ini: date, fin: date) -> str:
+    daily = salario_mensual / 30.0 if salario_mensual else 0.0
+    days = max((fin - ini).days, 0) if ini and fin else 0
+    years = days / 365.0 if days else 0.0
 
-    total = aguinaldo_prop
-    base.update({
-        "indemnizacion_90_dias": 0.0,
-        "veinte_dias_por_anio": 0.0,
-        "total_estimado": total,
-    })
-    return base
+    if str(tipo_caso).strip() == "1":
+        ind_3m = daily * 90
+        ind_20 = daily * 20 * years
+        total = ind_3m + ind_20
+        return (
+            "📌 Estimación preliminar (informativa)\n"
+            f"• Antigüedad estimada: {years:.2f} años\n"
+            f"• 3 meses (90 días): ${ind_3m:,.2f}\n"
+            f"• 20 días por año: ${ind_20:,.2f}\n"
+            f"✅ Total estimado: ${total:,.2f}\n\n"
+            "Nota: puede variar por salario integrado, prima de antigüedad, salarios caídos y prestaciones."
+        )
 
-def fmt_money(x: float) -> str:
-    try:
-        return f"${x:,.2f} MXN"
-    except Exception:
-        return f"${x} MXN"
-
-def build_result_text(est: dict, tipo_caso: str) -> str:
-    parts = []
-    parts.append(f"Salario mensual reportado: {fmt_money(est.get('salario_diario', 0.0)*30)}")
-    if est.get("dias_trabajados") is not None:
-        parts.append(f"Tiempo aproximado trabajado: {int(est['dias_trabajados'])} días (~{est.get('anios_aprox',0):.2f} años)")
-    if tipo_caso == "1":
-        parts.append(f"Indemnización 90 días (aprox): {fmt_money(est.get('indemnizacion_90_dias',0.0))}")
-        parts.append(f"20 días por año (aprox): {fmt_money(est.get('veinte_dias_por_anio',0.0))}")
-    parts.append(f"Aguinaldo proporcional (aprox): {fmt_money(est.get('aguinaldo_proporcional',0.0))}")
-    parts.append(f"**Total preliminar estimado:** {fmt_money(est.get('total_estimado',0.0))}")
-    return " | ".join(parts)
-
-def append_gestion(ws_gestion, payload: dict):
-    values = get_all_values_safe(ws_gestion)
-    if not values or not values[0]:
-        return
-    hdr = values[0]
-    hmap = header_map(hdr)
-    row = [""] * len(hdr)
-
-    def setv(col, val):
-        if col in hmap:
-            row[hmap[col] - 1] = str(val)
-
-    for k, v in payload.items():
-        setv(k, v)
-
-    with_backoff(ws_gestion.append_row, row, value_input_option="USER_ENTERED")
+    return (
+        "📌 Estimación preliminar (informativa)\n"
+        "En renuncia normalmente se calcula finiquito con proporcionales (aguinaldo, vacaciones, prima vacacional, etc.).\n"
+        "Un abogado lo calculará con precisión según tus recibos y condiciones reales."
+    )
 
 def process_lead(lead_id: str):
     sh = open_spreadsheet(GOOGLE_SHEET_NAME)
     ws_leads = open_worksheet(sh, TAB_LEADS)
+    ws_abog  = open_worksheet(sh, TAB_ABOG)
 
-    values = get_all_values_safe(ws_leads)
-    idx = find_row_by_col_value(values, "ID_Lead", (lead_id or "").strip())
-    if idx is None:
-        return
+    row = find_row_by_value(ws_leads, "ID_Lead", lead_id)
+    if not row:
+        raise RuntimeError(f"Lead no encontrado: {lead_id}")
 
-    lead = row_to_dict(values[0], values[idx])
+    h = build_header_map(ws_leads)
+    vals = with_backoff(ws_leads.row_values, row)
 
-    telefono = (lead.get("Telefono") or "").strip().replace("whatsapp:", "")
-    nombre = (lead.get("Nombre") or "").strip()
-    apellido = (lead.get("Apellido") or "").strip()
-    tipo_caso = (lead.get("Tipo_Caso") or "").strip()
-    descripcion = (lead.get("Descripcion_Situacion") or "").strip()
-    salario = _to_float(lead.get("Salario_Mensual"), 0.0)
+    def get(name):
+        c = col_idx(h, name)
+        return (vals[c-1] if c and c-1 < len(vals) else "").strip()
 
-    f_ini = _build_date(lead.get("Inicio_Anio"), lead.get("Inicio_Mes"), lead.get("Inicio_Dia"))
-    f_fin = _build_date(lead.get("Fin_Anio"), lead.get("Fin_Mes"), lead.get("Fin_Dia"))
+    telefono = get("Telefono")
+    nombre = get("Nombre") or "Hola"
+    tipo_caso = get("Tipo_Caso")  # "1" despido, "2" renuncia
 
-    est = calcular_estimacion(tipo_caso, salario, f_ini, f_fin)
-    resultado_txt = build_result_text(est, tipo_caso)
+    ini = date(safe_int(get("Inicio_Anio")), safe_int(get("Inicio_Mes")), safe_int(get("Inicio_Dia")))
+    fin = date(safe_int(get("Fin_Anio")), safe_int(get("Fin_Mes")), safe_int(get("Fin_Dia")))
+    salario = money_to_float(get("Salario_Mensual"))
 
-    # asignar abogado
-    abogado_id = ""
-    abogado_nombre = ""
-    try:
-        ws_abogados = open_worksheet(sh, TAB_ABOGADOS)
-        ab_list = list_abogados(ws_abogados)
-        abogado = pick_abogado(ab_list, salario)
-        if abogado:
-            abogado_id = (abogado.get("ID_Abogado") or "").strip()
-            abogado_nombre = (abogado.get("Nombre") or abogado.get("Nombre_Abogado") or "").strip()
-            if abogado_id:
-                incrementar_carga(ws_abogados, abogado_id)
-    except Exception:
-        pass
+    abogado_id, abogado_nombre, abogado_tel = pick_abogado(ws_abog, salario)
 
-    token = (lead.get("Token_Reporte") or "").strip() or str(uuid.uuid4())[:12]
+    resumen = build_resumen(tipo_caso, nombre)
+    estimacion = calc_estimacion_simple(tipo_caso, salario, ini, fin)
 
-    # Link reporte desde Config_Sistema (KEY/VALUE) si existe RUTA_REPORTE
-    link_reporte = (lead.get("Link_Reporte_Web") or "").strip()
-    if not link_reporte:
-        try:
-            ws_sys = open_worksheet(sh, TAB_SYS)
-            sys_values = get_all_values_safe(ws_sys)
-            base_url = ""
-            if sys_values and len(sys_values) >= 2:
-                h = header_map(sys_values[0])
-                key_col = h.get("KEY") or h.get("Key") or 1
-                val_col = h.get("VALUE") or h.get("Value") or 2
-                for r in sys_values[1:]:
-                    k = (r[key_col-1] if key_col-1 < len(r) else "").strip()
-                    v = (r[val_col-1] if val_col-1 < len(r) else "").strip()
-                    if k.upper() in ("RUTA_REPORTE", "BASE_URL_REPORTE", "REPORTE_URL"):
-                        base_url = v
-                        break
-            if base_url:
-                sep = "&" if "?" in base_url else "?"
-                link_reporte = f"{base_url}{sep}token={token}"
-        except Exception:
-            link_reporte = ""
+    mensaje_final = (
+        f"✅ {nombre}, ya tengo tu estimación preliminar.\n\n"
+        f"{resumen}\n\n"
+        f"{estimacion}\n\n"
+        f"👩‍⚖️ La abogada que acompañará tu caso será: {abogado_nombre}.\n"
+        "Si quieres, puedo ayudarte a dar el siguiente paso desde aquí."
+    )
 
-    full_name = f"{nombre} {apellido}".strip()
-    sumario = generate_ai_summary(full_name, _tipo_caso_humano(tipo_caso), descripcion, resultado_txt)
-
-    msg_cliente = sumario
-    if link_reporte:
-        msg_cliente += f"\n\n📄 Tu reporte preliminar: {link_reporte}"
-    if abogado_nombre or abogado_id:
-        msg_cliente += f"\n\n👩‍⚖️ Abogada asignada (preliminar): {abogado_nombre or abogado_id}"
-
-    updates = {
-        "Resultado_Calculo": resultado_txt,
-        "Analisis_AI": sumario[:2000],
-        "Token_Reporte": token,
-        "Link_Reporte_Web": link_reporte,
+    # guardar en leads
+    update_row_cells(ws_leads, row, {
+        "Resultado_Calculo": estimacion,
+        "Analisis_AI": resumen,
         "Abogado_Asignado_ID": abogado_id,
         "Abogado_Asignado_Nombre": abogado_nombre,
-        "Ultima_Actualizacion": now_iso(),
+        "Procesar_AI_Status": "DONE",
         "ESTATUS": "CLIENTE_MENU",
         "Ultimo_Error": "",
-    }
-    update_row_cells(ws_leads, idx, updates)
+        "Ultima_Actualizacion": now_iso(),
+    })
 
-    # Gestion_Abogados (best effort)
-    try:
-        ws_gestion = open_worksheet(sh, TAB_GESTION)
-        append_gestion(ws_gestion, {
-            "Fecha_Hora": now_iso(),
-            "ID_Lead": lead_id,
-            "Telefono": telefono,
-            "Abogado_ID": abogado_id,
-            "Abogado_Nombre": abogado_nombre,
-            "Estatus": "ASIGNADO",
-        })
-    except Exception:
-        pass
+    # enviar WhatsApp
+    send_whatsapp(telefono, mensaje_final)
 
-    # Envío proactivo de WhatsApp
-    try:
-        if telefono:
-            send_whatsapp_message(telefono, msg_cliente)
-    except Exception as e:
-        update_row_cells(ws_leads, idx, {"Ultimo_Error": f"WHATSAPP_SEND: {str(e)[:220]}", "Ultima_Actualizacion": now_iso()})
+    # menú final
+    menu = (
+        f"Hola {nombre} 👋 ¿Qué opción deseas?\n\n"
+        "1️⃣ Próximas fechas agendadas\n"
+        "2️⃣ Resumen de mi caso hasta hoy\n"
+        "3️⃣ Contactar a mi abogado"
+    )
+    send_whatsapp(telefono, menu)
+
+    return {"ok": True, "lead_id": lead_id}

@@ -1,38 +1,39 @@
 import os
 import json
 import time
-import base64
 import random
-from typing import Any, Callable, Optional
+from typing import Dict, Any, Optional, Tuple, List
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-_GC = None
-_SS_CACHE = {}
-_WS_CACHE = {}
+_GC: Optional[gspread.Client] = None
+_SHEET_CACHE: Dict[str, gspread.Spreadsheet] = {}
+_WS_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
 
-def _load_service_account_info() -> dict:
-    json_str = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_CREDENTIALS_JSON") or "").strip()
-    if json_str:
-        return json.loads(json_str)
-
-    b64 = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64") or os.environ.get("GOOGLE_CREDENTIALS_B64") or "").strip()
-    if b64:
-        raw = base64.b64decode(b64.encode("utf-8")).decode("utf-8")
+def _load_service_account_info() -> Dict[str, Any]:
+    raw = (
+        os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+        or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    )
+    if raw:
         return json.loads(raw)
 
-    path = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if path:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    raise RuntimeError("Faltan credenciales Google. Define GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_CREDENTIALS_JSON (o GOOGLE_APPLICATION_CREDENTIALS).")
+    raise RuntimeError(
+        "Faltan credenciales Google. Define GOOGLE_CREDENTIALS_JSON o "
+        "GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_APPLICATION_CREDENTIALS."
+    )
 
 def get_gspread_client() -> gspread.Client:
     global _GC
@@ -43,87 +44,96 @@ def get_gspread_client() -> gspread.Client:
     _GC = gspread.authorize(creds)
     return _GC
 
-def open_spreadsheet(name: str) -> gspread.Spreadsheet:
-    if not name:
-        raise RuntimeError("GOOGLE_SHEET_NAME vacío.")
-    if name in _SS_CACHE:
-        return _SS_CACHE[name]
+def open_spreadsheet(sheet_name: str) -> gspread.Spreadsheet:
+    if not sheet_name:
+        raise RuntimeError("GOOGLE_SHEET_NAME está vacío.")
+    if sheet_name in _SHEET_CACHE:
+        return _SHEET_CACHE[sheet_name]
     gc = get_gspread_client()
-    sh = gc.open(name)
-    _SS_CACHE[name] = sh
+    sh = gc.open(sheet_name)
+    _SHEET_CACHE[sheet_name] = sh
     return sh
 
 def open_worksheet(sh: gspread.Spreadsheet, tab_name: str) -> gspread.Worksheet:
-    key = f"{sh.id}:{tab_name}"
+    key = (sh.id, tab_name)
     if key in _WS_CACHE:
         return _WS_CACHE[key]
     ws = sh.worksheet(tab_name)
     _WS_CACHE[key] = ws
     return ws
 
-def with_backoff(fn: Callable[..., Any], *args, **kwargs) -> Any:
-    max_tries = int(os.environ.get("SHEETS_MAX_TRIES", "5"))
-    base = float(os.environ.get("SHEETS_BACKOFF_BASE", "0.6"))
+def _is_rate_limit_error(err: Exception) -> bool:
+    if isinstance(err, APIError):
+        try:
+            code = err.response.status_code
+            return code in (429, 503)
+        except Exception:
+            return False
+    return False
+
+def with_backoff(fn, *args, **kwargs):
+    max_tries = 6
+    base = 0.8
     for i in range(max_tries):
         try:
             return fn(*args, **kwargs)
-        except Exception:
-            if i == max_tries - 1:
-                raise
-            sleep = base * (2 ** i) + random.random() * 0.25
-            time.sleep(sleep)
+        except Exception as e:
+            if _is_rate_limit_error(e):
+                sleep_s = base * (2 ** i) + random.random()
+                time.sleep(min(sleep_s, 6.0))
+                continue
+            raise
 
-def get_all_values_safe(ws: gspread.Worksheet):
-    return with_backoff(ws.get_all_values)
+def build_header_map(ws: gspread.Worksheet) -> Dict[str, int]:
+    headers = with_backoff(ws.row_values, 1)
+    clean = []
+    for h in headers:
+        clean.append((h or "").strip())
 
-def header_map(header_row: list[str]) -> dict[str, int]:
-    m = {}
-    for i, h in enumerate(header_row, start=1):
-        key = (h or "").strip()
-        if not key:
-            continue
-        if key not in m:
-            m[key] = i
-    return m
+    # Detecta vacíos / duplicados (esto es CLAVE para evitar errores raros)
+    if any(h == "" for h in clean):
+        raise RuntimeError(f"En la hoja '{ws.title}' hay encabezados vacíos en la fila 1.")
+    seen = set()
+    dups = []
+    for h in clean:
+        if h in seen:
+            dups.append(h)
+        seen.add(h)
+    if dups:
+        raise RuntimeError(f"En la hoja '{ws.title}' hay encabezados duplicados: {sorted(set(dups))}")
 
-def row_to_dict(header: list[str], row: list[str]) -> dict:
-    d = {}
-    for i, h in enumerate(header):
-        k = (h or "").strip()
-        if not k:
-            continue
-        d[k] = row[i] if i < len(row) else ""
-    return d
+    return {h: i + 1 for i, h in enumerate(clean)}
 
-def find_row_by_col_value(values: list[list[str]], col_name: str, needle: str) -> Optional[int]:
-    if not values or len(values) < 2:
+def col_idx(hmap: Dict[str, int], name: str) -> Optional[int]:
+    return hmap.get((name or "").strip())
+
+def find_row_by_value(ws: gspread.Worksheet, col_name: str, value: str) -> Optional[int]:
+    """
+    Busca value exacto en la columna col_name.
+    Retorna el número de fila (1-based) o None.
+    """
+    h = build_header_map(ws)
+    c = col_idx(h, col_name)
+    if not c:
         return None
-    header = values[0]
-    hmap = header_map(header)
-    if col_name not in hmap:
-        return None
-    j = hmap[col_name] - 1
-    needle = (needle or "").strip()
-    for i, row in enumerate(values[1:], start=1):
-        v = row[j].strip() if j < len(row) else ""
-        if v == needle:
-            return i  # índice real en values (incluye header)
+    col_vals = with_backoff(ws.col_values, c)
+    target = (value or "").strip()
+    for i, v in enumerate(col_vals, start=1):
+        if (v or "").strip() == target:
+            return i
     return None
 
-def update_row_cells(ws: gspread.Worksheet, values_index: int, updates: dict[str, Any]):
-    all_values = get_all_values_safe(ws)
-    if not all_values or not all_values[0]:
-        raise RuntimeError("Worksheet sin encabezados.")
-    hdr = all_values[0]
-    hmap = header_map(hdr)
+def update_row_cells(ws: gspread.Worksheet, row_num: int, updates: Dict[str, Any]):
+    """
+    Batch update por headers (atómico a nivel de request).
+    """
+    h = build_header_map(ws)
+    cell_list = []
+    for k, v in updates.items():
+        k = (k or "").strip()
+        if k in h:
+            cell_list.append(gspread.Cell(row_num, h[k], str(v)))
+    if cell_list:
+        with_backoff(ws.update_cells, cell_list, value_input_option="USER_ENTERED")
 
-    row_number = values_index + 1  # gspread es 1-based
-    cells = []
-    for col, val in updates.items():
-        if col not in hmap:
-            continue
-        col_number = hmap[col]
-        cells.append(gspread.Cell(row_number, col_number, str(val)))
-    if cells:
-        with_backoff(ws.update_cells, cells, value_input_option="USER_ENTERED")
 
