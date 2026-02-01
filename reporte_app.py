@@ -28,3 +28,4 @@ def reporte():
 
     return jsonify({"ok": False, "error": "Lead no encontrado"}), 404
 
+
