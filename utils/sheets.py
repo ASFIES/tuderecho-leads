@@ -1,3 +1,4 @@
+# utils/sheets.py
 import os
 import json
 import time
@@ -16,11 +17,13 @@ SCOPES = [
 _GC: Optional[gspread.Client] = None
 _SHEET_CACHE: Dict[str, gspread.Spreadsheet] = {}
 _WS_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
+_HDR_CACHE: Dict[Tuple[str, str], Dict[str, int]] = {}
 
 def _load_service_account_info() -> Dict[str, Any]:
     raw = (
         os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
         or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
     )
     if raw:
         return json.loads(raw)
@@ -31,8 +34,8 @@ def _load_service_account_info() -> Dict[str, Any]:
             return json.load(f)
 
     raise RuntimeError(
-        "Faltan credenciales Google. Define GOOGLE_CREDENTIALS_JSON o "
-        "GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_APPLICATION_CREDENTIALS."
+        "Faltan credenciales Google. Define GOOGLE_CREDENTIALS_JSON "
+        "o GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_APPLICATION_CREDENTIALS."
     )
 
 def get_gspread_client() -> gspread.Client:
@@ -84,15 +87,13 @@ def with_backoff(fn, *args, **kwargs):
                 continue
             raise
 
-def build_header_map(ws: gspread.Worksheet) -> Dict[str, int]:
-    headers = with_backoff(ws.row_values, 1)
-    clean = []
-    for h in headers:
-        clean.append((h or "").strip())
+def get_all_values_safe(ws: gspread.Worksheet) -> List[List[str]]:
+    return with_backoff(ws.get_all_values)
 
-    # Detecta vacíos / duplicados (esto es CLAVE para evitar errores raros)
+def header_map(headers: List[str]) -> Dict[str, int]:
+    clean = [(h or "").strip() for h in headers]
     if any(h == "" for h in clean):
-        raise RuntimeError(f"En la hoja '{ws.title}' hay encabezados vacíos en la fila 1.")
+        raise RuntimeError("Hay encabezados vacíos en la fila 1.")
     seen = set()
     dups = []
     for h in clean:
@@ -100,19 +101,49 @@ def build_header_map(ws: gspread.Worksheet) -> Dict[str, int]:
             dups.append(h)
         seen.add(h)
     if dups:
-        raise RuntimeError(f"En la hoja '{ws.title}' hay encabezados duplicados: {sorted(set(dups))}")
-
+        raise RuntimeError(f"Hay encabezados duplicados: {sorted(set(dups))}")
     return {h: i + 1 for i, h in enumerate(clean)}
+
+def build_header_map(ws: gspread.Worksheet) -> Dict[str, int]:
+    # cache por worksheet (id/título)
+    key = (ws.spreadsheet.id if hasattr(ws, "spreadsheet") else "sheet", ws.title)
+    if key in _HDR_CACHE:
+        return _HDR_CACHE[key]
+    headers = with_backoff(ws.row_values, 1)
+    hmap = header_map(headers)
+    _HDR_CACHE[key] = hmap
+    return hmap
 
 def col_idx(hmap: Dict[str, int], name: str) -> Optional[int]:
     return hmap.get((name or "").strip())
 
-def find_row_by_value(ws: gspread.Worksheet, col_name: str, value: str) -> Optional[int]:
-    """
-    Busca value exacto en la columna col_name.
-    Retorna el número de fila (1-based) o None.
-    """
-    h = build_header_map(ws)
+def row_to_dict(headers: List[str], row: List[str]) -> Dict[str, str]:
+    out = {}
+    for i, h in enumerate(headers):
+        h = (h or "").strip()
+        if not h:
+            continue
+        out[h] = (row[i] if i < len(row) else "").strip()
+    return out
+
+def find_row_by_col_value(values: List[List[str]], col_name: str, value: str) -> Optional[int]:
+    if not values or len(values) < 2:
+        return None
+    hdr = [(h or "").strip() for h in values[0]]
+    try:
+        idx = hdr.index(col_name)
+    except ValueError:
+        return None
+    target = (value or "").strip()
+    for i in range(1, len(values)):
+        row = values[i]
+        v = (row[idx] if idx < len(row) else "").strip()
+        if v == target:
+            return i
+    return None
+
+def find_row_by_value(ws: gspread.Worksheet, col_name: str, value: str, hmap: Optional[Dict[str, int]] = None) -> Optional[int]:
+    h = hmap or build_header_map(ws)
     c = col_idx(h, col_name)
     if not c:
         return None
@@ -123,11 +154,8 @@ def find_row_by_value(ws: gspread.Worksheet, col_name: str, value: str) -> Optio
             return i
     return None
 
-def update_row_cells(ws: gspread.Worksheet, row_num: int, updates: Dict[str, Any]):
-    """
-    Batch update por headers (atómico a nivel de request).
-    """
-    h = build_header_map(ws)
+def update_row_cells(ws: gspread.Worksheet, row_num: int, updates: Dict[str, Any], hmap: Optional[Dict[str, int]] = None):
+    h = hmap or build_header_map(ws)
     cell_list = []
     for k, v in updates.items():
         k = (k or "").strip()
@@ -135,5 +163,3 @@ def update_row_cells(ws: gspread.Worksheet, row_num: int, updates: Dict[str, Any
             cell_list.append(gspread.Cell(row_num, h[k], str(v)))
     if cell_list:
         with_backoff(ws.update_cells, cell_list, value_input_option="USER_ENTERED")
-
-

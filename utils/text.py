@@ -1,50 +1,31 @@
+# utils/text.py
 import re
 from typing import Dict
 
-def normalize_msg(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"[ \t]+", " ", s)
-    return s
-
 def normalize_option(msg: str) -> str:
-    msg = (msg or "").strip()
-    m = re.search(r"([1-9])", msg)
+    s = (msg or "").strip()
+    m = re.search(r"([1-9])", s)
     return m.group(1) if m else ""
 
 def render_text(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
-    return s.strip()
-
-def detect_fuente(first_msg: str) -> str:
-    msg = (first_msg or "").lower()
-    if "fb" in msg or "facebook" in msg or "anuncio" in msg:
-        return "FACEBOOK"
-    if "ig" in msg or "instagram" in msg:
-        return "INSTAGRAM"
-    return "DESCONOCIDA"
-
-def is_valid_by_rule(text: str, rule: str) -> bool:
-    text = (text or "").strip()
-    rule = (rule or "").strip()
-    if not rule:
-        return True
-    if rule.upper() == "MONEY":
-        return bool(re.fullmatch(r"\d{1,12}", text))
-    if rule.upper().startswith("REGEX:"):
-        pattern = rule.split(":", 1)[1].strip()
-        try:
-            return bool(re.fullmatch(pattern, text))
-        except re.error:
-            return True
-    return True
+    s = (s or "").strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1]
+    return s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").strip()
 
 def template_fill(template: str, lead: Dict[str, str]) -> str:
     t = template or ""
     for k, v in (lead or {}).items():
-        if not k:
-            continue
-        t = t.replace("{" + k + "}", str(v))
+        if k:
+            t = t.replace("{" + k + "}", str(v))
     return t
+
+def detect_fuente(msg: str) -> str:
+    t = (msg or "").lower()
+    if "facebook" in t or "anuncio" in t or "fb" in t:
+        return "FACEBOOK"
+    if "sitio" in t or "web" in t or "página" in t or "pagina" in t:
+        return "WEB"
+    if "instagram" in t or "ig" in t:
+        return "INSTAGRAM"
+    return "DESCONOCIDA"

@@ -1,3 +1,4 @@
+# utils/whatsapp.py
 import os
 from twilio.rest import Client
 
@@ -9,7 +10,7 @@ def _get_twilio_client():
     return Client(sid, token)
 
 def get_whatsapp_from_number() -> str:
-    num = (os.environ.get("TWILIO_WHATSAPP_NUMBER") or os.environ.get("WHATSAPP_NUMBER") or "").strip()
+    num = (os.environ.get("TWILIO_WHATSAPP_NUMBER") or "").strip()
     if not num:
         raise RuntimeError("Falta TWILIO_WHATSAPP_NUMBER (ej: whatsapp:+14155238886).")
     return num

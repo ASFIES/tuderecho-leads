@@ -1,10 +1,12 @@
+# app.py
 import os
 import re
 import uuid
+import html
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request
+from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 
 from redis import Redis
@@ -12,17 +14,19 @@ from rq import Queue
 
 from utils.sheets import (
     open_spreadsheet, open_worksheet, with_backoff,
-    build_header_map, col_idx, find_row_by_value, update_row_cells
+    build_header_map, col_idx, find_row_by_value, update_row_cells,
+    get_all_values_safe, row_to_dict, find_row_by_col_value
 )
+from utils.text import normalize_option, render_text, template_fill, detect_fuente
 
-MX_TZ = ZoneInfo(os.environ.get("TZ", "America/Mexico_City"))
+MX_TZ = ZoneInfo(os.environ.get("TZ", "America/Mexico_City").strip() or "America/Mexico_City")
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
 
 TAB_LEADS  = os.environ.get("TAB_LEADS", "BD_Leads").strip()
 TAB_LOGS   = os.environ.get("TAB_LOGS", "Logs").strip()
-TAB_CONFIG = os.environ.get("TAB_CONFIG", "Config_XimenaAI").strip()  # 👈 ÚNICA config
-TAB_SYS    = os.environ.get("TAB_SYS", "Config_Sistema").strip()      # 👈 Clave/Valor (opcional)
+TAB_CONFIG = (os.environ.get("TAB_CONFIG") or os.environ.get("TAB_FLOW") or "Config_XimenaAI").strip()
+TAB_SYS    = os.environ.get("TAB_SYS", "Config_Sistema").strip()
 
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
@@ -36,38 +40,6 @@ def _twiml(text: str):
     resp = MessagingResponse()
     resp.message(text)
     return str(resp)
-
-def normalize_option(msg: str) -> str:
-    s = (msg or "").strip()
-    # tomar el primer dígito que aparezca (soporta "1️⃣", " 1 ", "opción 1", etc.)
-    m = re.search(r"\d", s)
-    return m.group(0) if m else s
-
-def render_text(s: str) -> str:
-    s = (s or "").strip()
-    # si vienen comillas envolventes
-    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        s = s[1:-1]
-    # si alguien dejó \n literal
-    s = s.replace("\\n", "\n").replace("\\r\\n", "\n")
-    return s
-
-def detect_fuente(msg: str) -> str:
-    t = (msg or "").lower()
-    if "facebook" in t or "anuncio" in t or "fb" in t:
-        return "FACEBOOK"
-    if "sitio" in t or "web" in t or "página" in t or "pagina" in t:
-        return "WEB"
-    return "DESCONOCIDA"
-
-def load_config(ws_config):
-    rows = with_backoff(ws_config.get_all_records)
-    cfg = {}
-    for r in rows:
-        pid = (r.get("ID_Paso") or "").strip()
-        if pid:
-            cfg[pid] = r
-    return cfg
 
 def get_queue():
     if not REDIS_URL:
@@ -94,14 +66,39 @@ def log(ws_logs, lead_id, paso, msg_in, msg_out, telefono="", err=""):
     except Exception:
         pass
 
+def load_config(ws_config):
+    rows = with_backoff(ws_config.get_all_records)
+    cfg = {}
+    for r in rows:
+        pid = (r.get("ID_Paso") or "").strip()
+        if pid:
+            cfg[pid] = r
+    return cfg
+
+def step_type(cfg_row) -> str:
+    return (cfg_row.get("Tipo_Entrada") or "").strip().upper()
+
+def get_text(cfg_row) -> str:
+    return render_text(cfg_row.get("Texto_Bot") or "")
+
+def next_for_option(cfg_row, opt: str) -> str:
+    # Soporta Siguiente_Si_1 ... Siguiente_Si_9 si existen en Sheets
+    k = f"Siguiente_Si_{opt}"
+    if cfg_row.get(k):
+        return (cfg_row.get(k) or "").strip()
+    # fallback legacy
+    if opt == "1":
+        return (cfg_row.get("Siguiente_Si_1") or "").strip()
+    if opt == "2":
+        return (cfg_row.get("Siguiente_Si_2") or "").strip()
+    return ""
+
 def ensure_lead(ws_leads, from_phone: str):
     phone_norm = re.sub(r"\D+", "", (from_phone or "").replace("whatsapp:", ""))
     h = build_header_map(ws_leads)
 
-    # buscar por telefono_normalizado
-    row = find_row_by_value(ws_leads, "Telefono_Normalizado", phone_norm)
+    row = find_row_by_value(ws_leads, "Telefono_Normalizado", phone_norm, hmap=h)
     if row:
-        # leer fila completa en 1 llamada
         vals = with_backoff(ws_leads.row_values, row)
         def get(name):
             c = col_idx(h, name)
@@ -109,12 +106,12 @@ def ensure_lead(ws_leads, from_phone: str):
         lead_id = get("ID_Lead") or ""
         if not lead_id:
             lead_id = uuid.uuid4().hex[:12]
-            update_row_cells(ws_leads, row, {"ID_Lead": lead_id})
-        return row, lead_id, phone_norm
+            update_row_cells(ws_leads, row, {"ID_Lead": lead_id}, hmap=h)
+        return row, lead_id, phone_norm, h
 
-    # crear nuevo
     lead_id = uuid.uuid4().hex[:12]
     new_row = [""] * len(h)
+
     def setv(name, val):
         c = col_idx(h, name)
         if c:
@@ -129,79 +126,19 @@ def ensure_lead(ws_leads, from_phone: str):
     setv("ESTATUS", "INICIO")
 
     with_backoff(ws_leads.append_row, new_row, value_input_option="USER_ENTERED")
-    # Re-buscar
-    row2 = find_row_by_value(ws_leads, "Telefono_Normalizado", phone_norm)
-    return row2, lead_id, phone_norm
+    row2 = find_row_by_value(ws_leads, "Telefono_Normalizado", phone_norm, hmap=h)
+    return row2, lead_id, phone_norm, h
 
-def step_type(cfg_row) -> str:
-    return (cfg_row.get("Tipo_Entrada") or "").strip().upper()
+def read_lead_row(ws_leads, row_num: int, hmap):
+    vals = with_backoff(ws_leads.row_values, row_num)
+    d = {}
+    for k, idx in hmap.items():
+        d[k] = (vals[idx-1] if idx-1 < len(vals) else "").strip()
+    return d
 
-def next_for_option(cfg_row, opt: str) -> str:
-    if opt == "1":
-        return (cfg_row.get("Siguiente_Si_1") or "").strip()
-    if opt == "2":
-        return (cfg_row.get("Siguiente_Si_2") or "").strip()
-    # si algún día agregas 3,4,5... puedes extender aquí
-    return ""
-
-def get_text(cfg_row) -> str:
-    return render_text(cfg_row.get("Texto_Bot") or "")
-
-def auto_run_system(ws_leads, ws_logs, cfg, lead_row, lead_id, telefono, current_step: str):
-    """
-    Ejecuta 1-2 pasos SISTEMA sin esperar mensaje del usuario.
-    - Si cae en GENERAR_RESULTADOS o EN_PROCESO: encola y deja estatus EN_PROCESO.
-    """
-    safety = 0
-    step = current_step
-
-    while safety < 3:
-        safety += 1
-        row_cfg = cfg.get(step)
-        if not row_cfg:
-            break
-
-        t = step_type(row_cfg)
-        if t != "SISTEMA":
-            break
-
-        out = get_text(row_cfg) or "..."
-        # caso especial: disparar worker
-        if step in ("GENERAR_RESULTADOS", "EN_PROCESO"):
-            update_row_cells(ws_leads, lead_row, {
-                "Paso_Anterior": step,
-                "ESTATUS": "EN_PROCESO",
-                "Ultima_Actualizacion": now_iso(),
-                "Procesar_AI_Status": "ENQUEUED",
-                "Ultimo_Error": ""
-            })
-            q = get_queue()
-            if q is not None:
-                from worker_jobs import process_lead
-                q.enqueue(process_lead, lead_id, job_timeout=180)
-            log(ws_logs, lead_id, step, "", out, telefono=telefono, err="")
-            return out, "EN_PROCESO"
-
-        # avanzar al siguiente paso (usa Siguiente_Si_1 como "siguiente" para SISTEMA)
-        nxt = (row_cfg.get("Siguiente_Si_1") or "").strip()
-        if not nxt or nxt == step:
-            # si no hay siguiente, nos quedamos
-            log(ws_logs, lead_id, step, "", out, telefono=telefono, err="")
-            return out, step
-
-        # actualizar estatus al siguiente
-        update_row_cells(ws_leads, lead_row, {
-            "Paso_Anterior": step,
-            "ESTATUS": nxt,
-            "Ultima_Actualizacion": now_iso()
-        })
-        log(ws_logs, lead_id, step, "", out, telefono=telefono, err="")
-        step = nxt
-
-    # Si sale del loop, responde con el texto del paso actual (si existe)
-    row_cfg = cfg.get(step) or {}
-    out = get_text(row_cfg) or "..."
-    return out, step
+@app.get("/")
+def home():
+    return {"ok": True, "service": "ximena-web", "ts": now_iso()}
 
 @app.post("/whatsapp")
 def whatsapp_webhook():
@@ -216,20 +153,20 @@ def whatsapp_webhook():
 
         cfg = load_config(ws_cfg)
 
-        lead_row, lead_id, phone_norm = ensure_lead(ws_leads, from_phone)
+        lead_row, lead_id, phone_norm, h = ensure_lead(ws_leads, from_phone)
+        lead = read_lead_row(ws_leads, lead_row, h)
 
-        # leer estatus y nombre en 1 llamada
-        h = build_header_map(ws_leads)
-        vals = with_backoff(ws_leads.row_values, lead_row)
-        def get(name):
-            c = col_idx(h, name)
-            return (vals[c-1] if c and c-1 < len(vals) else "").strip()
+        estatus = (lead.get("ESTATUS") or "INICIO").strip() or "INICIO"
+        nombre  = (lead.get("Nombre") or "").strip()
 
-        estatus = get("ESTATUS") or "INICIO"
-        nombre  = get("Nombre") or ""
+        # Si está bloqueado por no aceptar aviso, no lo dejes avanzar
+        if (lead.get("Bloqueado_Por_No_Aceptar") or "").strip():
+            out = get_text(cfg.get("FIN_NO_ACEPTA", {})) or "Sin aviso de privacidad no podemos continuar."
+            log(ws_logs, lead_id, "FIN_NO_ACEPTA", msg_in_raw, out, telefono=from_phone, err="blocked")
+            return _twiml(out)
 
-        # guardar último mensaje y detectar fuente si es desconocida
-        fuente_actual = get("Fuente_Lead") or "DESCONOCIDA"
+        # Detectar fuente solo si no se había identificado
+        fuente_actual = (lead.get("Fuente_Lead") or "DESCONOCIDA").strip()
         if fuente_actual == "DESCONOCIDA":
             fuente_actual = detect_fuente(msg_in_raw)
 
@@ -237,31 +174,88 @@ def whatsapp_webhook():
             "Ultimo_Mensaje_Cliente": msg_in_raw,
             "Fuente_Lead": fuente_actual,
             "Ultima_Actualizacion": now_iso()
-        })
+        }, hmap=h)
 
-        # Si el paso actual es SISTEMA, lo ejecutamos sin esperar
-        if estatus in cfg and step_type(cfg[estatus]) == "SISTEMA":
-            out, _ = auto_run_system(ws_leads, ws_logs, cfg, lead_row, lead_id, from_phone, estatus)
-            return _twiml(out)
-
-        # Si estamos en INICIO y el usuario no mandó 1/2, solo mostramos INICIO sin validar
         msg_opt = normalize_option(msg_in_raw)
+
+        # ====== MENÚ CLIENTE (YA REGISTRADO) ======
+        if estatus == "CLIENTE_MENU":
+            menu_txt = get_text(cfg.get("CLIENTE_MENU", {})) or (
+                f"Hola {nombre or ''} 👋 ¿Qué opción deseas?\n\n"
+                "1️⃣ Próximas fechas agendadas\n"
+                "2️⃣ Resumen de mi caso hasta hoy\n"
+                "3️⃣ Contactar a mi abogada"
+            )
+            if msg_opt not in ("1", "2", "3"):
+                out = menu_txt.replace("{Nombre}", nombre or "")
+                log(ws_logs, lead_id, "CLIENTE_MENU", msg_in_raw, out, telefono=from_phone, err="")
+                return _twiml(out)
+
+            # 1) Fechas (por ahora informativo; después lo jalas de AppSheet)
+            if msg_opt == "1":
+                out = get_text(cfg.get("MENU_FECHAS", {})) or (
+                    f"{nombre or 'Hola'}, por ahora no tengo una fecha agendada aquí.\n\n"
+                    "📌 Tu abogada te contactará lo antes posible para coordinar el siguiente paso."
+                )
+                out = out.replace("{Nombre}", nombre or "")
+                log(ws_logs, lead_id, "MENU_FECHAS", msg_in_raw, out, telefono=from_phone, err="")
+                return _twiml(out)
+
+            # 2) Resumen
+            if msg_opt == "2":
+                resumen = (lead.get("Analisis_AI") or "").strip()
+                calc = (lead.get("Resultado_Calculo") or "").strip()
+                out = get_text(cfg.get("MENU_RESUMEN", {})) or (
+                    "📌 *Resumen de tu caso hasta hoy*\n\n"
+                    "{Analisis_AI}\n\n"
+                    "{Resultado_Calculo}\n\n"
+                    "Si deseas, responde 3 para contactar a tu abogada."
+                )
+                out = out.replace("{Nombre}", nombre or "")
+                out = out.replace("{Analisis_AI}", resumen or "Aún estamos integrando tu información.")
+                out = out.replace("{Resultado_Calculo}", calc or "Aún no hay cálculo registrado.")
+                log(ws_logs, lead_id, "MENU_RESUMEN", msg_in_raw, out, telefono=from_phone, err="")
+                return _twiml(out)
+
+            # 3) Contactar abogada
+            if msg_opt == "3":
+                abog = (lead.get("Abogado_Asignado_Nombre") or "Tu abogada").strip()
+                link = (lead.get("Link_WhatsApp") or "").strip()
+                out = get_text(cfg.get("MENU_CONTACTO", {})) or (
+                    f"👩‍⚖️ La abogada que acompaña tu caso es: {abog}.\n\n"
+                    f"{('📲 Puedes escribirle aquí: ' + link) if link else '📲 En breve te compartimos el medio de contacto.'}\n\n"
+                    "Si quieres volver al menú, escribe: *menu*"
+                )
+                log(ws_logs, lead_id, "MENU_CONTACTO", msg_in_raw, out, telefono=from_phone, err="")
+                return _twiml(out)
+
+        # Atajo: si el usuario escribe "menu" en cualquier punto y ya es cliente
+        if msg_in_raw.strip().lower() in ("menu", "menú"):
+            if (lead.get("Procesar_AI_Status") or "").strip().upper() == "DONE":
+                update_row_cells(ws_leads, lead_row, {"ESTATUS": "CLIENTE_MENU"}, hmap=h)
+                out = get_text(cfg.get("CLIENTE_MENU", {})) or "Menú:\n1 Fechas\n2 Resumen\n3 Abogada"
+                out = out.replace("{Nombre}", nombre or "")
+                log(ws_logs, lead_id, "CLIENTE_MENU", msg_in_raw, out, telefono=from_phone, err="")
+                return _twiml(out)
+
+        # Si estamos en INICIO y todavía no manda 1/2, solo mostramos INICIO
         if estatus == "INICIO" and msg_opt not in ("1", "2"):
             out = get_text(cfg.get("INICIO", {})) or "Hola, soy Ximena.\n1 Sí\n2 No"
+            out = out.replace("{Nombre}", nombre or "")
             log(ws_logs, lead_id, "INICIO", msg_in_raw, out, telefono=from_phone, err="")
             return _twiml(out)
 
         row_cfg = cfg.get(estatus)
         if not row_cfg:
+            update_row_cells(ws_leads, lead_row, {"ESTATUS": "INICIO"}, hmap=h)
             out = get_text(cfg.get("INICIO", {})) or "Hola, soy Ximena.\n1 Sí\n2 No"
-            update_row_cells(ws_leads, lead_row, {"ESTATUS": "INICIO"})
             log(ws_logs, lead_id, "INICIO", msg_in_raw, out, telefono=from_phone, err="missing_step")
             return _twiml(out)
 
         t = step_type(row_cfg)
         msg_err = render_text(row_cfg.get("Mensaje_Error") or "Por favor responde con una opción válida.")
 
-        # OPCIONES
+        # ====== OPCIONES ======
         if t == "OPCIONES":
             valid = [x.strip() for x in (row_cfg.get("Opciones_Validas") or "").split(",") if x.strip()]
             if msg_opt not in valid:
@@ -269,42 +263,55 @@ def whatsapp_webhook():
                 return _twiml(msg_err)
 
             nxt = next_for_option(row_cfg, msg_opt) or "INICIO"
-
             campo = (row_cfg.get("Campo_BD_Leads_A_Actualizar") or "").strip()
+
             upd = {"Paso_Anterior": estatus, "ESTATUS": nxt, "Ultima_Actualizacion": now_iso()}
             if campo:
                 upd[campo] = msg_opt
-            if estatus == "INICIO":
-                # guardamos aceptación de "comenzar" como opcional si quieres (no obligatorio)
-                pass
 
-            update_row_cells(ws_leads, lead_row, upd)
+            # Si rechazó aviso, bloquea
+            if estatus == "AVISO_PRIVACIDAD" and msg_opt == "2":
+                upd["Bloqueado_Por_No_Aceptar"] = "SI"
 
-            # Si el siguiente es SISTEMA, ejecútalo en caliente
-            if nxt in cfg and step_type(cfg[nxt]) == "SISTEMA":
-                out, _ = auto_run_system(ws_leads, ws_logs, cfg, lead_row, lead_id, from_phone, nxt)
+            update_row_cells(ws_leads, lead_row, upd, hmap=h)
+
+            # si el siguiente es EN_PROCESO, encola y responde EN_PROCESO
+            if nxt == "EN_PROCESO":
+                out = get_text(cfg.get("EN_PROCESO", {})) or "Estoy preparando tu estimación…"
+                # encolar una sola vez
+                q = get_queue()
+                if q is not None:
+                    from worker_jobs import process_lead
+                    update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ENQUEUED"}, hmap=h)
+                    q.enqueue(process_lead, lead_id, job_timeout=180)
+
+                out = out.replace("{Nombre}", nombre or "")
+                log(ws_logs, lead_id, "EN_PROCESO", msg_in_raw, out, telefono=from_phone, err="")
                 return _twiml(out)
 
             out = get_text(cfg.get(nxt, {})) or "Continuemos…"
-            out = out.replace("{Nombre}", nombre or "")
+            # refrescar nombre por si lo capturaste
+            lead2 = read_lead_row(ws_leads, lead_row, h)
+            out = out.replace("{Nombre}", (lead2.get("Nombre") or "").strip())
             log(ws_logs, lead_id, nxt, msg_in_raw, out, telefono=from_phone, err="")
             return _twiml(out)
 
-        # TEXTO
+        # ====== TEXTO ======
         if t == "TEXTO":
             regla = (row_cfg.get("Regla_Validacion") or "").strip()
-            if regla.startswith("REGEX:"):
-                pattern = regla.replace("REGEX:", "", 1).strip()
+            ok = True
+            if regla.upper() == "MONEY":
+                ok = bool(re.fullmatch(r"\d{1,12}", msg_in_raw.strip()))
+            elif regla.upper().startswith("REGEX:"):
+                pattern = regla.split(":", 1)[1].strip()
                 try:
-                    if not re.fullmatch(pattern, msg_in_raw.strip()):
-                        log(ws_logs, lead_id, estatus, msg_in_raw, msg_err, telefono=from_phone, err="invalid_regex")
-                        return _twiml(msg_err)
+                    ok = bool(re.fullmatch(pattern, msg_in_raw.strip()))
                 except re.error:
-                    pass
-            elif regla.upper() == "MONEY":
-                if not re.fullmatch(r"\d{1,9}", msg_in_raw.strip()):
-                    log(ws_logs, lead_id, estatus, msg_in_raw, msg_err, telefono=from_phone, err="invalid_money")
-                    return _twiml(msg_err)
+                    ok = True
+
+            if not ok:
+                log(ws_logs, lead_id, estatus, msg_in_raw, msg_err, telefono=from_phone, err="invalid_text")
+                return _twiml(msg_err)
 
             campo = (row_cfg.get("Campo_BD_Leads_A_Actualizar") or "").strip()
             nxt = (row_cfg.get("Siguiente_Si_1") or "").strip() or estatus
@@ -312,24 +319,103 @@ def whatsapp_webhook():
             upd = {"Paso_Anterior": estatus, "ESTATUS": nxt, "Ultima_Actualizacion": now_iso()}
             if campo:
                 upd[campo] = msg_in_raw.strip()
-            update_row_cells(ws_leads, lead_row, upd)
 
-            # Si el siguiente es SISTEMA, ejecútalo en caliente
-            if nxt in cfg and step_type(cfg[nxt]) == "SISTEMA":
-                out, _ = auto_run_system(ws_leads, ws_logs, cfg, lead_row, lead_id, from_phone, nxt)
-                return _twiml(out)
+            update_row_cells(ws_leads, lead_row, upd, hmap=h)
 
             out = get_text(cfg.get(nxt, {})) or "Gracias. Continuemos…"
-            out = out.replace("{Nombre}", nombre or "")
+            lead2 = read_lead_row(ws_leads, lead_row, h)
+            out = out.replace("{Nombre}", (lead2.get("Nombre") or "").strip())
             log(ws_logs, lead_id, nxt, msg_in_raw, out, telefono=from_phone, err="")
             return _twiml(out)
 
-        # fallback
-        out = "Gracias. Continuemos…"
-        log(ws_logs, lead_id, estatus, msg_in_raw, out, telefono=from_phone, err="unknown_tipo")
+        # ====== SISTEMA (FIN, etc.) ======
+        out = get_text(row_cfg) or "Gracias."
+        out = out.replace("{Nombre}", nombre or "")
+        log(ws_logs, lead_id, estatus, msg_in_raw, out, telefono=from_phone, err="system_step")
         return _twiml(out)
 
     except Exception:
         return _twiml("Perdón, tuve un problema técnico 🙏\nIntenta de nuevo en un momento.")
 
 
+# ====== REPORTE WEB (YA SIN reporte_app) ======
+@app.get("/reporte")
+def reporte():
+    token = (request.args.get("token") or "").strip()
+    lead_id = (request.args.get("lead") or "").strip()
+
+    if not token and not lead_id:
+        return ("Falta token o lead.", 400)
+
+    sh = open_spreadsheet(GOOGLE_SHEET_NAME)
+    ws_leads = open_worksheet(sh, TAB_LEADS)
+    values = get_all_values_safe(ws_leads)
+
+    idx = None
+    if token:
+        idx = find_row_by_col_value(values, "Token_Reporte", token)
+    if idx is None and lead_id:
+        idx = find_row_by_col_value(values, "ID_Lead", lead_id)
+
+    if idx is None:
+        return ("Reporte no encontrado.", 404)
+
+    lead = row_to_dict(values[0], values[idx])
+
+    nombre = html.escape((lead.get("Nombre") or "").strip())
+    apellido = html.escape((lead.get("Apellido") or "").strip())
+    tipo = html.escape((lead.get("Tipo_Caso") or "").strip())
+    desc = html.escape((lead.get("Descripcion_Situacion") or "").strip())
+    res = html.escape((lead.get("Resultado_Calculo") or "").strip())
+    ai = html.escape((lead.get("Analisis_AI") or "").strip())
+
+    tipo_h = "Despido" if tipo == "1" else ("Renuncia" if tipo == "2" else "Caso laboral")
+
+    return f"""
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Reporte preliminar</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background:#0b0f14; color:#f2f4f7; margin:0; }}
+    .wrap {{ max-width:980px; margin:0 auto; padding:22px; }}
+    .card {{ background:#111827; border:1px solid #1f2937; border-radius:16px; padding:18px; margin-bottom:14px; }}
+    h1 {{ margin:0 0 8px 0; font-size:22px; }}
+    h2 {{ margin:0 0 8px 0; font-size:16px; color:#93c5fd; }}
+    p {{ margin:0; line-height:1.45; white-space:pre-wrap; }}
+    .muted {{ color:#9ca3af; font-size:12px; }}
+    .btn {{ display:inline-block; margin-top:10px; background:#2563eb; color:white; padding:10px 14px; border-radius:10px; text-decoration:none; }}
+    .btn2 {{ display:inline-block; margin-top:10px; background:#111827; border:1px solid #374151; color:white; padding:10px 14px; border-radius:10px; text-decoration:none; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Reporte preliminar</h1>
+      <p class="muted">Generado: {now_iso()} · Este reporte es informativo y no constituye asesoría legal.</p>
+      <a class="btn" href="#" onclick="window.print();return false;">Imprimir</a>
+      <a class="btn2" href="/">Volver</a>
+    </div>
+
+    <div class="card">
+      <h2>Datos del caso</h2>
+      <p><b>Nombre:</b> {nombre} {apellido}</p>
+      <p><b>Tipo:</b> {tipo_h}</p>
+      <p><b>Descripción:</b> {desc}</p>
+    </div>
+
+    <div class="card">
+      <h2>Estimación preliminar</h2>
+      <p>{res}</p>
+    </div>
+
+    <div class="card">
+      <h2>Orientación (informativa)</h2>
+      <p>{ai}</p>
+    </div>
+  </div>
+</body>
+</html>
+"""
