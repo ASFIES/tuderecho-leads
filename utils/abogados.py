@@ -1,38 +1,63 @@
-from utils.sheets import build_header_map, col_idx
+import random
+from typing import Dict, List, Optional
 
-def pick_abogado_from_sheet(ws_abogados, salario_mensual: float):
-    """
-    Regla: salario >= 50000 => abogado con ID_Abogado = A01 (desde sheet)
-    Si no existe A01 o no activo, se cae a primer activo.
-    """
-    h = build_header_map(ws_abogados)
-    idc = col_idx(h, "ID_Abogado")
-    nc = col_idx(h, "Nombre_Abogado")
-    tc = col_idx(h, "Telefono_Abogado")
-    ac = col_idx(h, "Activo")
+from utils.sheets import get_all_values_safe, header_map, row_to_dict, with_backoff
 
-    rows = ws_abogados.get_all_values()[1:]  # list of lists
+def list_abogados(ws_abogados) -> List[Dict[str, str]]:
+    values = get_all_values_safe(ws_abogados)
+    if not values or len(values) < 2:
+        return []
+    hdr = values[0]
+    out = []
+    for row in values[1:]:
+        d = row_to_dict(hdr, row)
+        if (d.get("ID_Abogado") or "").strip():
+            out.append(d)
+    return out
 
-    def row_to_tuple(r):
-        aid = (r[idc-1] if idc and idc-1 < len(r) else "").strip()
-        an = (r[nc-1] if nc and nc-1 < len(r) else "").strip()
-        at = (r[tc-1] if tc and tc-1 < len(r) else "").strip()
-        activo = (r[ac-1] if ac and ac-1 < len(r) else "SI").strip().upper()
-        return aid, an, at, activo
+def pick_abogado(abogados: List[Dict[str, str]], salario_mensual: float) -> Optional[Dict[str, str]]:
+    def is_active(a):
+        v = (a.get("Activo") or a.get("ACTIVO") or "1").strip()
+        return v not in ("0", "NO", "FALSE", "False", "")
 
-    # 1) si salario >= 50k => A01
     if salario_mensual >= 50000:
-        for r in rows:
-            aid, an, at, activo = row_to_tuple(r)
-            if aid == "A01" and activo == "SI":
-                return aid, an or "Abogada A01", at
-        # si A01 no está activo o no existe, continuamos a fallback
+        for a in abogados:
+            if (a.get("ID_Abogado") or "").strip() == "A01" and is_active(a):
+                return a
 
-    # 2) primer activo
-    for r in rows:
-        aid, an, at, activo = row_to_tuple(r)
-        if activo == "SI" and aid:
-            return aid, an or f"Abogada {aid}", at
+    activos = [a for a in abogados if is_active(a)]
+    if not activos:
+        return None
 
-    # 3) fallback duro
-    return "A01", "Abogada asignada", ""
+    def load(a):
+        try:
+            return int(float((a.get("Leads_Asignados_Hoy") or "0").strip() or "0"))
+        except Exception:
+            return 0
+
+    activos.sort(key=load)
+    top = activos[: min(3, len(activos))]
+    return random.choice(top)
+
+def incrementar_carga(ws_abogados, abogado_id: str):
+    values = get_all_values_safe(ws_abogados)
+    if not values or len(values) < 2:
+        return
+    hdr = values[0]
+    hmap = header_map(hdr)
+    if "ID_Abogado" not in hmap or "Leads_Asignados_Hoy" not in hmap:
+        return
+
+    col_id = hmap["ID_Abogado"] - 1
+    col_load = hmap["Leads_Asignados_Hoy"] - 1
+
+    for i, row in enumerate(values[1:], start=1):
+        if col_id < len(row) and row[col_id].strip() == abogado_id:
+            current = 0
+            try:
+                current = int(float((row[col_load] or "0").strip() or "0"))
+            except Exception:
+                current = 0
+            new_val = current + 1
+            with_backoff(ws_abogados.update_cell, i + 1, col_load + 1, str(new_val))
+            return

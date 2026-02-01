@@ -1,85 +1,50 @@
 import re
-import unicodedata
-from datetime import datetime
-
-def render_text(s: str) -> str:
-    s = s or ""
-    return s.replace("\\n", "\n")
-
-def phone_raw(raw: str) -> str:
-    return (raw or "").strip()
-
-def phone_norm(raw: str) -> str:
-    s = (raw or "").strip()
-    s = s.replace("whatsapp:", "").strip()
-    return s
+from typing import Dict
 
 def normalize_msg(s: str) -> str:
     s = (s or "").strip()
-    s = unicodedata.normalize("NFKC", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[ \t]+", " ", s)
     return s
 
-def normalize_option(s: str) -> str:
-    s = normalize_msg(s)
-    m = re.search(r"\d", s)
-    if m:
-        return m.group(0)
-    return s
+def normalize_option(msg: str) -> str:
+    msg = (msg or "").strip()
+    m = re.search(r"([1-9])", msg)
+    return m.group(1) if m else ""
 
-def detect_fuente(msg: str) -> str:
-    t = (msg or "").lower()
-    if "facebook" in t or "anuncio" in t or "fb" in t:
+def render_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    return s.strip()
+
+def detect_fuente(first_msg: str) -> str:
+    msg = (first_msg or "").lower()
+    if "fb" in msg or "facebook" in msg or "anuncio" in msg:
         return "FACEBOOK"
-    if "sitio" in t or "web" in t or "pagina" in t or "página" in t:
-        return "WEB"
+    if "ig" in msg or "instagram" in msg:
+        return "INSTAGRAM"
     return "DESCONOCIDA"
 
-def is_valid_by_rule(value: str, rule: str) -> bool:
-    value = (value or "").strip()
+def is_valid_by_rule(text: str, rule: str) -> bool:
+    text = (text or "").strip()
     rule = (rule or "").strip()
-
     if not rule:
         return True
-
-    if rule.startswith("REGEX:"):
-        pattern = rule.replace("REGEX:", "", 1).strip()
+    if rule.upper() == "MONEY":
+        return bool(re.fullmatch(r"\d{1,12}", text))
+    if rule.upper().startswith("REGEX:"):
+        pattern = rule.split(":", 1)[1].strip()
         try:
-            return re.match(pattern, value) is not None
-        except:
-            return False
-
-    if rule == "MONEY":
-        try:
-            x = float(value.replace("$", "").replace(",", "").strip())
-            return x >= 0
-        except:
-            return False
-
+            return bool(re.fullmatch(pattern, text))
+        except re.error:
+            return True
     return True
 
-def build_date_from_parts(y: str, m: str, d: str) -> str:
-    y = (y or "").strip()
-    m = (m or "").strip()
-    d = (d or "").strip()
-    if not (y and m and d):
-        return ""
-    try:
-        yy = int(y); mm = int(m); dd = int(d)
-        dt = datetime(yy, mm, dd)
-        return dt.strftime("%Y-%m-%d")
-    except:
-        return ""
-
-def money_to_float(s: str) -> float:
-    try:
-        return float(str(s).replace("$", "").replace(",", "").strip() or "0")
-    except:
-        return 0.0
-
-def safe_name(nombre: str) -> str:
-    n = (nombre or "").strip()
-    if not n:
-        return "Hola"
-    return n[:1].upper() + n[1:]
+def template_fill(template: str, lead: Dict[str, str]) -> str:
+    t = template or ""
+    for k, v in (lead or {}).items():
+        if not k:
+            continue
+        t = t.replace("{" + k + "}", str(v))
+    return t

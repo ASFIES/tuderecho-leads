@@ -1,38 +1,23 @@
 import os
 from twilio.rest import Client
 
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
-WHATSAPP_NUMBER = os.environ.get("WHATSAPP_NUMBER", "").strip()  # whatsapp:+1415...
+def _get_twilio_client():
+    sid = (os.environ.get("TWILIO_ACCOUNT_SID") or "").strip()
+    token = (os.environ.get("TWILIO_AUTH_TOKEN") or "").strip()
+    if not sid or not token:
+        raise RuntimeError("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN.")
+    return Client(sid, token)
 
-_client = None
+def get_whatsapp_from_number() -> str:
+    num = (os.environ.get("TWILIO_WHATSAPP_NUMBER") or os.environ.get("WHATSAPP_NUMBER") or "").strip()
+    if not num:
+        raise RuntimeError("Falta TWILIO_WHATSAPP_NUMBER (ej: whatsapp:+14155238886).")
+    return num
 
-
-def _get_client():
-    global _client
-    if _client is None:
-        if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-            raise RuntimeError("Faltan TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN.")
-        _client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    return _client
-
-
-def send_whatsapp_message(to_number: str, body: str):
-    """
-    to_number puede venir como:
-    - whatsapp:+52...
-    - +52...
-    """
-    if not WHATSAPP_NUMBER:
-        raise RuntimeError("Falta WHATSAPP_NUMBER (tu número habilitado en Twilio).")
-
-    to = to_number.strip()
-    if not to.startswith("whatsapp:"):
-        to = "whatsapp:" + to
-
-    c = _get_client()
-    c.messages.create(
-        from_=WHATSAPP_NUMBER,
-        to=to,
-        body=body
-    )
+def send_whatsapp_message(to_phone: str, body: str):
+    client = _get_twilio_client()
+    from_num = get_whatsapp_from_number()
+    to_phone = (to_phone or "").strip()
+    if not to_phone.startswith("whatsapp:"):
+        to_phone = "whatsapp:" + to_phone
+    return client.messages.create(from_=from_num, to=to_phone, body=body)

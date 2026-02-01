@@ -1,87 +1,51 @@
-import re
+import os
 
-def _pick_knowledge(tipo_txt: str, conocimiento_rows: list[dict]) -> str:
-    """
-    Selecciona 1-3 temas relevantes desde Conocimiento_AI
-    """
-    keys = []
-    if tipo_txt == "despido":
-        keys = ["despido", "liquidación", "indemnización", "artículo 47", "artículo 48"]
-    else:
-        keys = ["renuncia", "finiquito", "prestaciones", "aguinaldo", "vacaciones"]
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-    picked = []
-    for r in conocimiento_rows or []:
-        content = (r.get("Contenido_Legal") or "")
-        title = (r.get("Titulo_Visible") or "")
-        kw = (r.get("Palabras_Clave") or "")
-        blob = f"{title}\n{kw}\n{content}".lower()
-        if any(k in blob for k in keys):
-            picked.append(f"### {title}\n{content}")
-        if len(picked) >= 2:
-            break
+def build_summary_prompt(nombre: str, tipo_caso: str, descripcion: str, resultado: str) -> str:
+    return f"""
+Eres una asistente legal (recepcionista) de un despacho laboral en México.
+Redacta un mensaje cálido, humano y claro (180 a 230 palabras) dirigido a {nombre or "la persona"}, en español.
+Objetivo: explicar de forma preliminar (no asesoría) qué significa su caso, qué se calculó y qué sigue.
 
-    if not picked and conocimiento_rows:
-        r = conocimiento_rows[0]
-        picked.append(f"### {r.get('Titulo_Visible','')}\n{r.get('Contenido_Legal','')}")
+Contexto del caso:
+- Tipo de caso: {tipo_caso}
+- Descripción (cliente): {descripcion}
+- Resultado preliminar (cifras/resumen): {resultado}
 
-    # recorta para no meter demasiado
-    joined = "\n\n".join(picked)
-    joined = re.sub(r"\s+", " ", joined).strip()
-    return joined[:1800]
+Reglas:
+- NO pidas correo.
+- Incluye un disclaimer breve de que es informativo y no constituye asesoría.
+- No prometas resultados; sí invita a confirmar datos con un abogado.
+- Termina con una pregunta cerrada: "¿Deseas que un abogado revise tu caso hoy? 1) Sí  2) No"
+"""
 
-def generar_resumen_legal_empatico(
-    ai_client,
-    model: str,
-    tipo_txt: str,
-    descripcion_usuario: str,
-    conocimiento_rows: list[dict],
-    max_words: int = 220,
-) -> str:
-    """
-    Resumen largo, humano, con base legal. Si no hay OpenAI, fallback.
-    """
-    fallback = (
-        "Con lo que me compartes, revisaremos tu caso para identificar prestaciones pendientes "
-        "(como salarios devengados, aguinaldo proporcional, vacaciones y prima vacacional) y, "
-        "si aplica, la indemnización correspondiente. Un abogado confirmará contigo los datos clave "
-        "y te orientará sobre el camino más seguro para proteger tus derechos."
-    )
+def generate_ai_summary(nombre: str, tipo_caso: str, descripcion: str, resultado: str) -> str:
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    model = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-    if not ai_client:
-        return fallback
-
-    contexto = _pick_knowledge(tipo_txt, conocimiento_rows)
-
-    system = (
-        "Eres una recepcionista legal empática de un despacho laboral en México. "
-        "Redacta un resumen claro, humano y profesional en español, con base legal general "
-        "(sin dar asesoría definitiva). "
-        "No pidas correo. No prometas tiempos exactos. "
-        f"Extensión objetivo: {max_words-40} a {max_words+40} palabras."
-    )
-
-    user = (
-        f"Tipo de caso: {tipo_txt}\n"
-        f"Situación del cliente: {descripcion_usuario}\n\n"
-        f"Contexto legal del despacho (para apoyar el texto): {contexto}\n\n"
-        "Incluye:\n"
-        "- 1 frase de comprensión (empatía)\n"
-        "- 1 frase de tranquilidad (acompañamiento)\n"
-        "- 1 mención general a LFT (arts. 47/48 si es despido; si renuncia, finiquito)\n"
-        "- 1 cierre indicando que una abogada revisará el caso."
-    )
-
-    try:
-        resp = ai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=340,
+    if not api_key or OpenAI is None:
+        nombre = nombre or "Hola"
+        return (
+            f"{nombre}, gracias por compartir tu información. Con los datos que nos diste, preparamos una estimación preliminar "
+            f"para tu caso ({tipo_caso}). {resultado}\n\n"
+            "Aviso: esta información es únicamente informativa y no constituye asesoría legal. Un abogado confirmará los datos y "
+            "te explicará opciones y estrategia.\n\n"
+            "¿Deseas que un abogado revise tu caso hoy?\n1) Sí\n2) No"
         )
-        txt = (resp.choices[0].message.content or "").strip()
-        return txt or fallback
-    except:
-        return fallback
+
+    client = OpenAI(api_key=api_key)
+    prompt = build_summary_prompt(nombre, tipo_caso, descripcion, resultado)
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "Eres una asistente legal empática y precisa."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.4,
+    )
+    return (resp.choices[0].message.content or "").strip()
