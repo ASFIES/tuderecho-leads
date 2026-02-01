@@ -1,7 +1,6 @@
 # reporte_app.py
 import os
 from flask import Flask, jsonify, request
-
 from utils.sheets import open_spreadsheet, open_worksheet, with_backoff
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
@@ -28,3 +27,5 @@ def reporte():
             return jsonify({"ok": True, "lead": r})
 
     return jsonify({"ok": False, "error": "Token no encontrado"}), 404
+
+

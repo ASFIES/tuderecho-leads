@@ -15,3 +15,4 @@ if __name__ == "__main__":
     with Connection(conn):
         worker = Worker([Queue(REDIS_QUEUE_NAME)])
         worker.work(with_scheduler=False)
+z   
