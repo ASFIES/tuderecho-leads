@@ -1,7 +1,9 @@
+# utils/sheets.py
 import os
 import json
 import time
 import random
+import base64
 from typing import Optional, Dict, Any, List, Tuple
 
 import gspread
@@ -11,7 +13,6 @@ from gspread.exceptions import APIError
 # =========================
 # SCOPES (CLAVE PARA 403)
 # =========================
-# Esto evita: "Request had insufficient authentication scopes"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -22,25 +23,91 @@ _GC: Optional[gspread.Client] = None
 _SHEET_CACHE: Dict[str, gspread.Spreadsheet] = {}
 _WS_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
 
+# ==========================================================
+# CREDENCIALES: soporta múltiples nombres de variables ENV
+# ==========================================================
+ENV_JSON_CANDIDATES = [
+    "GOOGLE_SERVICE_ACCOUNT_JSON",   # ✅ estándar nuevo
+    "GOOGLE_CREDENTIALS_JSON",       # ✅ el que tú tienes en Render
+    "GOOGLE_CREDENTIALIALS_JSON",    # ✅ por si quedó con typo en Render
+    "GOOGLE_CREDE​NTIALS_JSON",       # (cualquier variante rara: se ignora si no existe)
+]
+
+ENV_B64_CANDIDATES = [
+    "GOOGLE_SERVICE_ACCOUNT_B64",
+    "GOOGLE_CREDENTIALS_B64",
+    "GOOGLE_CREDENTIALIALS_B64",
+]
+
+def _try_json_load(raw: str) -> Optional[Dict[str, Any]]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def _try_b64_json(raw: str) -> Optional[Dict[str, Any]]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8", errors="ignore")
+        return _try_json_load(decoded)
+    except Exception:
+        return None
+
 def _load_service_account_info() -> Dict[str, Any]:
     """
     Lee credenciales desde:
     - GOOGLE_SERVICE_ACCOUNT_JSON (JSON completo como string)
-    o
+    - GOOGLE_CREDENTIALS_JSON (compat)
+    - GOOGLE_CREDENTIALIALS_JSON (compat typo)
     - GOOGLE_APPLICATION_CREDENTIALS (path a archivo json)
+    - o variantes B64 (base64)
     """
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if raw:
-        return json.loads(raw)
 
+    # 1) JSON directo (varios nombres posibles)
+    for key in ENV_JSON_CANDIDATES:
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            info = _try_json_load(raw)
+            if info:
+                return info
+            # a veces lo guardan como base64 sin querer
+            info = _try_b64_json(raw)
+            if info:
+                return info
+            raise RuntimeError(
+                f"La variable {key} existe pero NO es JSON válido (ni base64 JSON). "
+                "Verifica que pegaste el JSON completo del Service Account."
+            )
+
+    # 2) Base64 explícito
+    for key in ENV_B64_CANDIDATES:
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            info = _try_b64_json(raw)
+            if info:
+                return info
+            raise RuntimeError(
+                f"La variable {key} existe pero NO se pudo decodificar como base64 JSON."
+            )
+
+    # 3) Path a archivo
     path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if path:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    # 4) Nada encontrado
     raise RuntimeError(
-        "Faltan credenciales Google. Define GOOGLE_SERVICE_ACCOUNT_JSON "
-        "o GOOGLE_APPLICATION_CREDENTIALS."
+        "Faltan credenciales Google. Define una de estas variables:\n"
+        "- GOOGLE_CREDENTIALS_JSON (tu Render actual)\n"
+        "- GOOGLE_SERVICE_ACCOUNT_JSON\n"
+        "- GOOGLE_APPLICATION_CREDENTIALS (ruta a json)\n"
+        "- GOOGLE_CREDENTIALS_B64 / GOOGLE_SERVICE_ACCOUNT_B64\n"
     )
 
 def get_gspread_client() -> gspread.Client:
@@ -55,8 +122,8 @@ def get_gspread_client() -> gspread.Client:
 
 def open_spreadsheet(sheet_name: str) -> gspread.Spreadsheet:
     """
-    Abre por NOMBRE (como ya lo usas).
-    Tip: asegúrate de compartir el Sheet con el email del Service Account.
+    Abre por NOMBRE.
+    Asegúrate de compartir el Google Sheet con el email del Service Account.
     """
     if not sheet_name:
         raise RuntimeError("GOOGLE_SHEET_NAME está vacío.")
@@ -71,51 +138,3 @@ def open_spreadsheet(sheet_name: str) -> gspread.Spreadsheet:
 def open_worksheet(sh: gspread.Spreadsheet, tab_name: str) -> gspread.Worksheet:
     key = (sh.id, tab_name)
     if key in _WS_CACHE:
-        return _WS_CACHE[key]
-    ws = sh.worksheet(tab_name)
-    _WS_CACHE[key] = ws
-    return ws
-
-def _is_rate_limit_error(err: Exception) -> bool:
-    if isinstance(err, APIError):
-        try:
-            code = err.response.status_code
-            return code in (429, 503)
-        except Exception:
-            return False
-    return False
-
-def with_backoff(fn, *args, **kwargs):
-    """
-    Backoff para evitar que el Worker se muera con 429.
-    """
-    max_tries = 6
-    base = 0.8
-    for i in range(max_tries):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            if _is_rate_limit_error(e):
-                sleep_s = base * (2 ** i) + random.random()
-                time.sleep(sleep_s)
-                continue
-            raise
-
-def get_all_records_cached(ws: gspread.Worksheet, cache_seconds: int = 15) -> List[Dict[str, Any]]:
-    """
-    Cache corto para lecturas repetidas del worker (reduce 429).
-    """
-    now = time.time()
-    cache_key = (ws.id, "all_records")
-    if not hasattr(get_all_records_cached, "_cache"):
-        get_all_records_cached._cache = {}  # type: ignore
-
-    c = get_all_records_cached._cache  # type: ignore
-    if cache_key in c:
-        ts, data = c[cache_key]
-        if now - ts <= cache_seconds:
-            return data
-
-    data = with_backoff(ws.get_all_records)
-    c[cache_key] = (now, data)
-    return data
