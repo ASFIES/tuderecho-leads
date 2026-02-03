@@ -28,7 +28,7 @@ TAB_LOGS   = os.environ.get("TAB_LOGS", "Logs").strip()
 TAB_CONFIG = (os.environ.get("TAB_CONFIG") or os.environ.get("TAB_FLOW") or "Config_XimenaAI").strip()
 TAB_SYS    = os.environ.get("TAB_SYS", "Config_Sistema").strip()
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://red-d5vsiqm3jp1c73cfkof0:6379").strip()
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
 
 app = Flask(__name__)

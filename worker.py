@@ -3,7 +3,7 @@ import os
 from redis import Redis
 from rq import Worker, Queue, Connection
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://red-d5vsiqm3jp1c73cfkof0:6379").strip()
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
 
 if not REDIS_URL:
