@@ -1,25 +1,35 @@
 # utils/sheets.py
 import os
-import json
-import ast
-import base64
+import re
 import time
-import random
-from typing import Any, Dict, Optional, List, Tuple
+import json
+import base64
+import ast
+from typing import Any, Dict, Optional, List, Callable, Tuple
 
 import gspread
 from gspread.cell import Cell
 from google.oauth2.service_account import Credentials
-from google.auth.exceptions import GoogleAuthError
 
 
 # =========================
-# Backoff / Retry helper
+# Config
 # =========================
-def with_backoff(fn, *args, retries: int = 6, base: float = 0.6, jitter: float = 0.25, **kwargs):
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# Cache global (evita re-autenticar por cada request)
+_GSPREAD_CLIENT: Optional[gspread.Client] = None
+
+
+# =========================
+# Backoff helper
+# =========================
+def with_backoff(fn: Callable, *args, retries: int = 6, base_sleep: float = 0.6, **kwargs):
     """
-    Ejecuta fn(*args, **kwargs) con reintentos exponenciales.
-    Útil para errores temporales de Google Sheets / red.
+    Reintenta llamadas a Google API / gspread con backoff exponencial.
     """
     last_err = None
     for i in range(retries):
@@ -27,225 +37,248 @@ def with_backoff(fn, *args, retries: int = 6, base: float = 0.6, jitter: float =
             return fn(*args, **kwargs)
         except Exception as e:
             last_err = e
-            sleep = (base * (2 ** i)) + random.uniform(0, jitter)
-            time.sleep(sleep)
+            # Backoff exponencial con jitter simple
+            sleep_s = base_sleep * (2 ** i)
+            time.sleep(min(sleep_s, 6.0))
     raise last_err
 
 
 # =========================
-# Credentials loader (ENV)
+# Credentials parsing
 # =========================
-def _load_service_account_info() -> Dict[str, Any]:
-    """
-    Lee credenciales desde variables de entorno (Render):
-      - GOOGLE_CREDENTIALS_JSON  (recomendado)
-      - GOOGLE_CREDENTIALS_B64   (opcional: JSON en base64)
-      - GOOGLE_CREDENTIALS_JSON_BASE64 (alias opcional)
+def _looks_like_base64(s: str) -> bool:
+    s = s.strip()
+    if len(s) < 40:
+        return False
+    # “eyJ” suele ser JSON en base64 ({" ... })
+    if s.startswith("eyJ"):
+        return True
+    # heurística: solo charset base64 y múltiplo aproximado
+    if re.fullmatch(r"[A-Za-z0-9+/=\s]+", s) and ("{" not in s):
+        return True
+    return False
 
-    Soporta:
-      - JSON válido con comillas dobles
-      - "dict" estilo Python con comillas simples (lo convierte con ast.literal_eval)
-    """
-    raw = (os.environ.get("GOOGLE_CREDENTIALS_JSON") or "").strip()
 
-    # Alternativa: base64
-    b64 = (os.environ.get("GOOGLE_CREDENTIALS_B64") or os.environ.get("GOOGLE_CREDENTIALS_JSON_BASE64") or "").strip()
-
-    if not raw and b64:
-        try:
-            decoded = base64.b64decode("".join(b64.split()), validate=True).decode("utf-8")
-            raw = decoded.strip()
-        except Exception as e:
-            raise RuntimeError(f"GOOGLE_CREDENTIALS_B64 inválido/base64 corrupto. Detalle: {e}")
-
-    if not raw:
-        raise RuntimeError("Falta GOOGLE_CREDENTIALS_JSON (o GOOGLE_CREDENTIALS_B64) en variables de entorno.")
-
-    # Quita comillas externas si Render lo guardó como string envuelto
-    if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
-        raw = raw[1:-1].strip()
-
-    # A veces Render/pegado incluye \\n literales; esto no rompe JSON en general,
-    # pero si te lo pegaron como texto plano raro, ayuda a normalizar.
-    # (No afecta si ya viene bien.)
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Si NO parece JSON y NO está en dict, intentar base64 “embebido”
-    # (por si alguien pegó el base64 en GOOGLE_CREDENTIALS_JSON)
-    if not raw.lstrip().startswith("{"):
-        try:
-            decoded = base64.b64decode("".join(raw.split()), validate=True).decode("utf-8")
-            raw = decoded.strip()
-        except Exception:
-            # Si no era base64, seguimos igual; luego fallará con mensaje claro.
-            pass
-
-    # 1) JSON normal (comillas dobles)
+def _try_b64_decode(raw: str) -> Optional[str]:
     try:
-        info = json.loads(raw)
-    except json.JSONDecodeError:
-        # 2) Fallback: dict Python (comillas simples) => ast.literal_eval
+        b = base64.b64decode(raw.strip())
+        return b.decode("utf-8", errors="strict")
+    except Exception:
+        return None
+
+
+def _unescape_if_needed(raw: str) -> str:
+    """
+    Si viene con secuencias escapadas tipo \" o \\n o \\' las convertimos.
+    """
+    if any(x in raw for x in ('\\n', '\\"', "\\'")):
         try:
-            info = ast.literal_eval(raw)
-        except Exception as e:
-            raise RuntimeError(
-                "GOOGLE_CREDENTIALS_JSON no es JSON válido ni dict Python válido. "
-                f"Ejemplo esperado: {{\"type\":\"service_account\", ...}}. Detalle: {e}"
-            )
+            return bytes(raw, "utf-8").decode("unicode_escape")
+        except Exception:
+            return raw
+    return raw
 
-    if not isinstance(info, dict):
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON no produjo un dict válido.")
 
-    # Validación mínima
-    if info.get("type") != "service_account":
-        # No forzamos hard-fail porque hay casos raros, pero avisamos
-        # (Si quieres hard-fail, cambia a raise RuntimeError)
+def _parse_service_account(raw: str) -> Dict[str, Any]:
+    """
+    Acepta:
+    - JSON normal (con comillas dobles)
+    - dict estilo Python (comillas simples)
+    - JSON/dict escapado (\\", \\' , \\n)
+    - Base64 de JSON
+    """
+    if not raw or not raw.strip():
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON está vacío.")
+
+    raw0 = raw.strip()
+
+    # 1) Si parece base64, intentar decode
+    if _looks_like_base64(raw0):
+        dec = _try_b64_decode(raw0)
+        if dec:
+            raw0 = dec.strip()
+
+    # 2) Si viene envuelto en comillas externas
+    if (raw0.startswith('"') and raw0.endswith('"')) or (raw0.startswith("'") and raw0.endswith("'")):
+        raw0 = raw0[1:-1].strip()
+
+    # 3) Des-escapar si tiene \", \n, \'
+    raw1 = _unescape_if_needed(raw0)
+
+    # 4) Intentar JSON directo
+    try:
+        data = json.loads(raw1)
+        if isinstance(data, dict):
+            return data
+    except Exception:
         pass
 
+    # 5) Reparación común: quitar backslashes antes de comillas
+    raw2 = raw1.replace("\\'", "'").replace('\\"', '"')
+
+    # 6) Intentar JSON otra vez
+    try:
+        data = json.loads(raw2)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 7) Intentar dict estilo Python
+    try:
+        data = ast.literal_eval(raw2)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        # diagnóstico útil
+        snippet = raw2[:220].replace("\n", "\\n")
+        raise RuntimeError(
+            "GOOGLE_CREDENTIALS_JSON no es JSON válido ni dict Python válido.\n"
+            "TIP: Pega el JSON del service account tal cual (con comillas dobles) en Render.\n"
+            f"Detalle parse: {e}\n"
+            f"Inicio del valor: {snippet}"
+        )
+
+
+def _load_service_account_info() -> Dict[str, Any]:
+    """
+    Lee credenciales desde env.
+    Soporta varios nombres por compatibilidad.
+    """
+    raw = (
+        os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        or os.environ.get("GOOGLE_CREDENTIALS")
+        or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        or ""
+    ).strip()
+
+    info = _parse_service_account(raw)
+
+    # Validación mínima (sin romper si falta algo no crítico)
+    if not isinstance(info, dict):
+        raise RuntimeError("Credenciales inválidas: no es objeto/dict.")
+
+    # Campos típicos de service_account
+    if "type" in info and str(info["type"]).strip() != "service_account":
+        # no lo hacemos fatal, pero avisaría
+        pass
+
+    # Si private_key trae saltos reales de línea dentro de la cadena (mal pegado),
+    # suele romper JSON antes. Aquí ya parseó, así que normalmente viene bien con \n.
     return info
 
 
 # =========================
-# gspread client (cached)
+# Gspread client
 # =========================
-_GC = None  # cache global
-
-def get_gspread_client(scopes: Optional[List[str]] = None) -> gspread.Client:
-    """
-    Crea y cachea el cliente de gspread usando GOOGLE_CREDENTIALS_JSON.
-    """
-    global _GC
-    if _GC is not None:
-        return _GC
-
-    if scopes is None:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
+def get_gspread_client() -> gspread.Client:
+    global _GSPREAD_CLIENT
+    if _GSPREAD_CLIENT is not None:
+        return _GSPREAD_CLIENT
 
     info = _load_service_account_info()
-    try:
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        _GC = gspread.authorize(creds)
-        return _GC
-    except (GoogleAuthError, ValueError) as e:
-        raise RuntimeError(f"No se pudo autorizar con Google Credentials. Detalle: {e}")
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    _GSPREAD_CLIENT = gspread.authorize(creds)
+    return _GSPREAD_CLIENT
 
 
-def open_spreadsheet(sheet_name: str):
+def open_spreadsheet(sheet_name_or_key: str):
     """
-    Abre un Google Sheet por nombre.
+    Abre spreadsheet por:
+    - Título (nombre)
+    - Key (id)
+    - URL completa
     """
-    if not sheet_name:
-        raise RuntimeError("Falta GOOGLE_SHEET_NAME.")
+    if not sheet_name_or_key or not sheet_name_or_key.strip():
+        raise RuntimeError("Falta GOOGLE_SHEET_NAME (o el nombre/id del spreadsheet).")
+
+    s = sheet_name_or_key.strip()
+
+    # Si es URL, extraer key
+    if "docs.google.com" in s and "/spreadsheets/d/" in s:
+        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+        if m:
+            s = m.group(1)
+
     gc = get_gspread_client()
-    return with_backoff(gc.open, sheet_name)
+
+    # Si parece key (id), abrir por key
+    if re.fullmatch(r"[a-zA-Z0-9-_]{25,}", s):
+        return with_backoff(gc.open_by_key, s)
+
+    # Si no, asumir título
+    return with_backoff(gc.open, s)
 
 
-def open_worksheet(sh, tab_name: str):
-    """
-    Abre una hoja dentro del spreadsheet por nombre de pestaña.
-    """
-    if not tab_name:
+def open_worksheet(spreadsheet, tab_name: str):
+    if not tab_name or not tab_name.strip():
         raise RuntimeError("Nombre de pestaña vacío.")
-    return with_backoff(sh.worksheet, tab_name)
+    return with_backoff(spreadsheet.worksheet, tab_name.strip())
 
 
 # =========================
-# Sheet helpers
+# Sheet utilities
 # =========================
+def build_header_map(ws) -> Dict[str, int]:
+    """
+    Retorna {header: col_index(1-based)}
+    """
+    headers = with_backoff(ws.row_values, 1)
+    hmap: Dict[str, int] = {}
+    for i, h in enumerate(headers, start=1):
+        key = (h or "").strip()
+        if key:
+            hmap[key] = i
+    return hmap
+
+
+def col_idx(hmap: Dict[str, int], col_name: str) -> Optional[int]:
+    return hmap.get((col_name or "").strip())
+
+
 def get_all_values_safe(ws) -> List[List[str]]:
-    """
-    Obtiene todos los valores (incluye encabezados).
-    Si falla, regresa [].
-    """
     try:
         return with_backoff(ws.get_all_values)
     except Exception:
         return []
 
 
-def build_header_map(ws) -> Dict[str, int]:
-    """
-    Lee la primera fila como encabezados y devuelve dict: {header: col_index(1-based)}.
-    """
-    values = get_all_values_safe(ws)
-    if not values or not values[0]:
-        return {}
-    headers = [str(h).strip() for h in values[0]]
-    hmap = {}
-    for i, h in enumerate(headers, start=1):
-        if h:
-            hmap[h] = i
-    return hmap
-
-
-def col_idx(hmap: Dict[str, int], name: str) -> Optional[int]:
-    """
-    Devuelve índice 1-based de la columna por nombre.
-    Hace match exacto, y si no, intenta case-insensitive.
-    """
-    if not hmap or not name:
-        return None
-
-    if name in hmap:
-        return hmap[name]
-
-    low = name.strip().lower()
-    for k, v in hmap.items():
-        if k.strip().lower() == low:
-            return v
-    return None
-
-
 def row_to_dict(headers: List[str], row: List[str]) -> Dict[str, str]:
-    """
-    Convierte (headers, row) a dict.
-    """
-    d = {}
+    d: Dict[str, str] = {}
     for i, h in enumerate(headers):
-        if not h:
+        k = (h or "").strip()
+        if not k:
             continue
-        d[h] = (row[i] if i < len(row) else "")
+        d[k] = (row[i] if i < len(row) else "").strip()
     return d
 
 
-def find_row_by_col_value(values: List[List[str]], col_name: str, target_value: str) -> Optional[int]:
+def find_row_by_col_value(values: List[List[str]], col_name: str, value: str) -> Optional[int]:
     """
-    Busca en 'values' (get_all_values) una fila donde col_name == target_value.
-    Regresa índice de fila (0-based sobre values) o None.
-    Nota: values[0] debe ser header.
+    values: matriz completa (incluye headers en values[0])
+    Retorna índice de fila (0-based) dentro de values si encuentra, si no None.
     """
     if not values or len(values) < 2:
         return None
-
-    headers = [str(x).strip() for x in values[0]]
+    headers = values[0]
     try:
         col = headers.index(col_name)
     except ValueError:
-        # case-insensitive fallback
-        col = None
-        low = col_name.strip().lower()
-        for i, h in enumerate(headers):
-            if h.strip().lower() == low:
-                col = i
-                break
-        if col is None:
-            return None
+        return None
 
-    t = (target_value or "").strip()
-    for r in range(1, len(values)):
-        row = values[r]
-        v = (row[col] if col < len(row) else "").strip()
-        if v == t:
-            return r
+    target = (value or "").strip()
+    for i in range(1, len(values)):
+        row = values[i]
+        cell = (row[col] if col < len(row) else "").strip()
+        if cell == target:
+            return i
     return None
 
 
-def find_row_by_value(ws, col_name: str, target_value: str, hmap: Optional[Dict[str, int]] = None) -> Optional[int]:
+def find_row_by_value(ws, col_name: str, value: str, hmap: Optional[Dict[str, int]] = None) -> Optional[int]:
     """
-    Busca número de fila (1-based en Google Sheets) donde col_name == target_value.
+    Busca fila (1-based en Google Sheets) donde col_name == value
     """
     if hmap is None:
         hmap = build_header_map(ws)
@@ -258,20 +291,19 @@ def find_row_by_value(ws, col_name: str, target_value: str, hmap: Optional[Dict[
     if not values or len(values) < 2:
         return None
 
-    t = (target_value or "").strip()
-    # values[0] es header, rows empiezan en 2
-    for i in range(1, len(values)):
-        row = values[i]
-        v = (row[c - 1] if (c - 1) < len(row) else "").strip()
-        if v == t:
-            return i + 1  # 1-based sheet row
+    target = (value or "").strip()
+    for r_i in range(2, len(values) + 1):  # 1-based row, empezando en 2
+        row = values[r_i - 1]
+        cell = (row[c - 1] if (c - 1) < len(row) else "").strip()
+        if cell == target:
+            return r_i
     return None
 
 
 def update_row_cells(ws, row_num: int, updates: Dict[str, Any], hmap: Optional[Dict[str, int]] = None):
     """
-    Actualiza varias celdas en una misma fila según nombre de columna.
-    Usa update_cells (batch).
+    Actualiza múltiples celdas de una misma fila en 1 sola llamada (update_cells).
+    updates: {"ColHeader": "valor", ...}
     """
     if not updates:
         return
@@ -283,9 +315,8 @@ def update_row_cells(ws, row_num: int, updates: Dict[str, Any], hmap: Optional[D
     for k, v in updates.items():
         c = col_idx(hmap, k)
         if not c:
-            # si la columna no existe, no truena el sistema (solo ignora)
             continue
-        cells.append(Cell(row=row_num, col=c, value="" if v is None else str(v)))
+        cells.append(Cell(row=row_num, col=c, value=str(v)))
 
     if not cells:
         return
@@ -293,12 +324,12 @@ def update_row_cells(ws, row_num: int, updates: Dict[str, Any], hmap: Optional[D
     with_backoff(ws.update_cells, cells, value_input_option="USER_ENTERED")
 
 
-def find_row_by_col_value_in_ws(ws, col_name: str, target_value: str) -> Optional[int]:
+def find_row_by_col_value_ws(ws, col_name: str, value: str) -> Optional[int]:
     """
-    Atajo: busca en worksheet y regresa row_num (1-based).
+    Variante que opera directo con ws.
     """
     values = get_all_values_safe(ws)
-    idx0 = find_row_by_col_value(values, col_name, target_value)
+    idx0 = find_row_by_col_value(values, col_name, value)
     if idx0 is None:
         return None
-    return idx0 + 1  # convierte de 0-based en values a 1-based en sheet
+    return idx0 + 1  # convertir a row_num 1-based
