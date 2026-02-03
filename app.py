@@ -21,7 +21,7 @@ from utils.sheets import (
 from utils.text import normalize_option, render_text, detect_fuente
 
 # =========================
-# Timezone / ENV
+# ENV / Timezone
 # =========================
 MX_TZ = ZoneInfo(os.environ.get("TZ", "America/Mexico_City").strip() or "America/Mexico_City")
 
@@ -34,9 +34,6 @@ TAB_SYS    = os.environ.get("TAB_SYS", "Config_Sistema").strip()
 
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
-
-# Modo para aislar Twilio (sin Sheets / sin Redis)
-SAFE_MODE = (os.environ.get("SAFE_MODE", "0").strip() == "1")
 
 app = Flask(__name__)
 
@@ -161,44 +158,30 @@ def home():
         "ok": True,
         "service": "ximena-web",
         "ts": now_iso(),
-        "safe_mode": SAFE_MODE,
-        "hint": "Twilio debe hacer POST a / (root) o a /whatsapp"
+        "hint": "Twilio debe hacer POST a /whatsapp (o / si quedó apuntando al root)."
     }
 
 @app.get("/health")
 def health():
     return {"ok": True, "ts": now_iso()}
 
-# Para que puedas abrir /whatsapp en el navegador sin 405
+# Útil para probar en navegador (sin Twilio)
 @app.get("/whatsapp")
-def whatsapp_get():
-    return {"ok": True, "ts": now_iso(), "hint": "Twilio debe hacer POST a este endpoint."}
+def whatsapp_get_probe():
+    return {"ok": True, "ts": now_iso(), "note": "Este endpoint debe recibir POST desde Twilio."}
 
-# ✅ Alias: si Twilio quedó apuntando a "/" en vez de "/whatsapp"
+# Alias: si Twilio quedó apuntando al root "/"
 @app.post("/")
 def whatsapp_root_alias():
     return whatsapp_webhook()
 
 @app.post("/whatsapp")
 def whatsapp_webhook():
-    # Twilio manda x-www-form-urlencoded; request.values es más tolerante
-    msg_in_raw = (request.values.get("Body") or "").strip()
-    from_phone = (request.values.get("From") or "").strip()
+    msg_in_raw = (request.form.get("Body") or "").strip()
+    from_phone = (request.form.get("From") or "").strip()
 
-    # LOG para confirmar que Twilio sí pegó aquí
+    # Log para confirmar que Twilio pegó aquí
     app.logger.info(f"[TWILIO IN] path={request.path} from={from_phone} body={msg_in_raw}")
-
-    # ====== PRUEBA DE CONECTIVIDAD (sin Sheets) ======
-    if SAFE_MODE:
-        if msg_in_raw.lower() == "ping":
-            return twiml("pong ✅ (Twilio -> Render OK)")
-        return twiml(
-            "✅ Ya estoy en línea.\n"
-            "Soy *Ximena AI*.\n\n"
-            "Para iniciar escribe:\n"
-            "1️⃣ Sí acepto\n"
-            "2️⃣ No acepto"
-        )
 
     try:
         if not GOOGLE_SHEET_NAME:
@@ -218,13 +201,13 @@ def whatsapp_webhook():
         estatus = (lead.get("ESTATUS") or "INICIO").strip() or "INICIO"
         nombre  = (lead.get("Nombre") or "").strip()
 
-        # Bloqueado por no aceptar aviso
+        # Bloqueo por no aceptar aviso
         if (lead.get("Bloqueado_Por_No_Aceptar") or "").strip():
             out = get_text(cfg.get("FIN_NO_ACEPTA", {})) or "Sin aviso de privacidad no podemos continuar."
             log(ws_logs, lead_id, "FIN_NO_ACEPTA", msg_in_raw, out, telefono=from_phone, err="blocked")
             return twiml(out)
 
-        # Fuente
+        # Detectar fuente si no está definida
         fuente_actual = (lead.get("Fuente_Lead") or "DESCONOCIDA").strip()
         if fuente_actual == "DESCONOCIDA":
             fuente_actual = detect_fuente(msg_in_raw)
@@ -237,7 +220,16 @@ def whatsapp_webhook():
 
         msg_opt = normalize_option(msg_in_raw)
 
-        # ===== INICIO (si no manda 1/2) =====
+        # Atajo "menu"
+        if msg_in_raw.strip().lower() in ("menu", "menú"):
+            if (lead.get("Procesar_AI_Status") or "").strip().upper() == "DONE":
+                update_row_cells(ws_leads, lead_row, {"ESTATUS": "CLIENTE_MENU"}, hmap=h)
+                out = get_text(cfg.get("CLIENTE_MENU", {})) or "Menú:\n1 Fechas\n2 Resumen\n3 Abogada"
+                out = out.replace("{Nombre}", nombre or "")
+                log(ws_logs, lead_id, "CLIENTE_MENU", msg_in_raw, out, telefono=from_phone, err="")
+                return twiml(out)
+
+        # Si está en INICIO y no manda 1/2, mostramos INICIO
         if estatus == "INICIO" and msg_opt not in ("1", "2"):
             out = get_text(cfg.get("INICIO", {})) or "Hola, soy Ximena.\n\n1️⃣ Sí\n2️⃣ No"
             out = out.replace("{Nombre}", nombre or "")
@@ -273,7 +265,7 @@ def whatsapp_webhook():
 
             update_row_cells(ws_leads, lead_row, upd, hmap=h)
 
-            # Si EN_PROCESO: encola si hay redis, si no, responde igual
+            # Si el siguiente es EN_PROCESO, encola (si Redis existe)
             if nxt == "EN_PROCESO":
                 out = get_text(cfg.get("EN_PROCESO", {})) or "Estoy preparando tu estimación…"
 
@@ -283,7 +275,7 @@ def whatsapp_webhook():
                         from worker_jobs import process_lead
                         update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ENQUEUED"}, hmap=h)
                         q.enqueue(process_lead, lead_id, job_timeout=180)
-                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} en cola={REDIS_QUEUE_NAME}")
+                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} cola={REDIS_QUEUE_NAME}")
                     except Exception as e:
                         app.logger.exception(f"[RQ] No se pudo encolar: {e}")
                         update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ERROR_ENQUEUE"}, hmap=h)
