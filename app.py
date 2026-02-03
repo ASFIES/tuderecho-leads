@@ -3,6 +3,7 @@ import os
 import re
 import uuid
 import html
+import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,9 @@ from utils.sheets import (
 )
 from utils.text import normalize_option, render_text, template_fill, detect_fuente
 
+# =========================
+# TIMEZONE / ENV
+# =========================
 MX_TZ = ZoneInfo(os.environ.get("TZ", "America/Mexico_City").strip() or "America/Mexico_City")
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
@@ -31,17 +35,23 @@ TAB_SYS    = os.environ.get("TAB_SYS", "Config_Sistema").strip()
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
 
+# =========================
+# FLASK APP
+# =========================
 app = Flask(__name__)
+app.url_map.strict_slashes = False  # ✅ evita problema /whatsapp vs /whatsapp/
 
 def now_iso():
     return datetime.now(MX_TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 def _twiml(text: str):
+    """✅ Twilio responde mejor si devolvemos XML explícito."""
     resp = MessagingResponse()
     resp.message(text)
-    return str(resp)
+    return Response(str(resp), mimetype="application/xml")
 
 def get_queue():
+    """Devuelve cola si REDIS_URL existe; si no, None."""
     if not REDIS_URL:
         return None
     conn = Redis.from_url(REDIS_URL)
@@ -100,9 +110,11 @@ def ensure_lead(ws_leads, from_phone: str):
     row = find_row_by_value(ws_leads, "Telefono_Normalizado", phone_norm, hmap=h)
     if row:
         vals = with_backoff(ws_leads.row_values, row)
+
         def get(name):
             c = col_idx(h, name)
             return (vals[c-1] if c and c-1 < len(vals) else "").strip()
+
         lead_id = get("ID_Lead") or ""
         if not lead_id:
             lead_id = uuid.uuid4().hex[:12]
@@ -136,16 +148,27 @@ def read_lead_row(ws_leads, row_num: int, hmap):
         d[k] = (vals[idx-1] if idx-1 < len(vals) else "").strip()
     return d
 
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
 def home():
     return {"ok": True, "service": "ximena-web", "ts": now_iso()}
 
-@app.post("/whatsapp")
+@app.route("/whatsapp", methods=["GET", "POST"])
 def whatsapp_webhook():
-    msg_in_raw = (request.form.get("Body") or "").strip()
-    from_phone = (request.form.get("From") or "").strip()
+    # ✅ GET para probar desde navegador que el endpoint existe
+    if request.method == "GET":
+        return {"ok": True, "hint": "Twilio debe hacer POST aqui", "ts": now_iso()}, 200
 
+    # ✅ DEBUG: esto debe verse en Render logs SI Twilio pega al endpoint
     try:
+        msg_in_raw = (request.form.get("Body") or "").strip()
+        from_phone = (request.form.get("From") or "").strip()
+
+        print(f"[HIT /whatsapp] ts={now_iso()} from={from_phone} body={msg_in_raw}")
+        # Si quieres más: print("form_keys=", list(request.form.keys()))
+
         sh = open_spreadsheet(GOOGLE_SHEET_NAME)
         ws_leads = open_worksheet(sh, TAB_LEADS)
         ws_logs  = open_worksheet(sh, TAB_LOGS)
@@ -191,7 +214,7 @@ def whatsapp_webhook():
                 log(ws_logs, lead_id, "CLIENTE_MENU", msg_in_raw, out, telefono=from_phone, err="")
                 return _twiml(out)
 
-            # 1) Fechas (por ahora informativo; después lo jalas de AppSheet)
+            # 1) Fechas
             if msg_opt == "1":
                 out = get_text(cfg.get("MENU_FECHAS", {})) or (
                     f"{nombre or 'Hola'}, por ahora no tengo una fecha agendada aquí.\n\n"
@@ -229,7 +252,7 @@ def whatsapp_webhook():
                 log(ws_logs, lead_id, "MENU_CONTACTO", msg_in_raw, out, telefono=from_phone, err="")
                 return _twiml(out)
 
-        # Atajo: si el usuario escribe "menu" en cualquier punto y ya es cliente
+        # Atajo: si el usuario escribe "menu" y ya es cliente (DONE)
         if msg_in_raw.strip().lower() in ("menu", "menú"):
             if (lead.get("Procesar_AI_Status") or "").strip().upper() == "DONE":
                 update_row_cells(ws_leads, lead_row, {"ESTATUS": "CLIENTE_MENU"}, hmap=h)
@@ -278,19 +301,24 @@ def whatsapp_webhook():
             # si el siguiente es EN_PROCESO, encola y responde EN_PROCESO
             if nxt == "EN_PROCESO":
                 out = get_text(cfg.get("EN_PROCESO", {})) or "Estoy preparando tu estimación…"
-                # encolar una sola vez
+
+                # encolar una sola vez (si hay redis + worker_jobs existe)
                 q = get_queue()
                 if q is not None:
-                    from worker_jobs import process_lead
-                    update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ENQUEUED"}, hmap=h)
-                    q.enqueue(process_lead, lead_id, job_timeout=180)
+                    try:
+                        from worker_jobs import process_lead
+                        update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ENQUEUED"}, hmap=h)
+                        q.enqueue(process_lead, lead_id, job_timeout=180)
+                    except Exception as e:
+                        # ✅ no rompas el chat si worker no existe
+                        update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ERROR_WORKER_IMPORT"}, hmap=h)
+                        log(ws_logs, lead_id, "EN_PROCESO", msg_in_raw, out, telefono=from_phone, err=f"worker_import:{e}")
 
                 out = out.replace("{Nombre}", nombre or "")
                 log(ws_logs, lead_id, "EN_PROCESO", msg_in_raw, out, telefono=from_phone, err="")
                 return _twiml(out)
 
             out = get_text(cfg.get(nxt, {})) or "Continuemos…"
-            # refrescar nombre por si lo capturaste
             lead2 = read_lead_row(ws_leads, lead_row, h)
             out = out.replace("{Nombre}", (lead2.get("Nombre") or "").strip())
             log(ws_logs, lead_id, nxt, msg_in_raw, out, telefono=from_phone, err="")
@@ -334,11 +362,12 @@ def whatsapp_webhook():
         log(ws_logs, lead_id, estatus, msg_in_raw, out, telefono=from_phone, err="system_step")
         return _twiml(out)
 
-    except Exception:
+    except Exception as e:
+        print("[ERROR /whatsapp]", repr(e))
+        print(traceback.format_exc())
         return _twiml("Perdón, tuve un problema técnico 🙏\nIntenta de nuevo en un momento.")
 
-
-# ====== REPORTE WEB (YA SIN reporte_app) ======
+# ====== REPORTE WEB ======
 @app.get("/reporte")
 def reporte():
     token = (request.args.get("token") or "").strip()
