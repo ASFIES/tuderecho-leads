@@ -20,9 +20,6 @@ from utils.sheets import (
 )
 from utils.text import normalize_option, render_text, detect_fuente
 
-# =========================
-# Timezone / ENV
-# =========================
 MX_TZ = ZoneInfo(os.environ.get("TZ", "America/Mexico_City").strip() or "America/Mexico_City")
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
@@ -37,9 +34,6 @@ REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
 
 app = Flask(__name__)
 
-# =========================
-# Helpers
-# =========================
 def now_iso():
     return datetime.now(MX_TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -149,9 +143,6 @@ def read_lead_row(ws_leads, row_num: int, hmap):
         d[k] = (vals[idx-1] if idx-1 < len(vals) else "").strip()
     return d
 
-# =========================
-# Routes
-# =========================
 @app.get("/")
 def home():
     return {
@@ -172,16 +163,14 @@ def whatsapp_root_alias():
 
 @app.post("/whatsapp")
 def whatsapp_webhook():
-    # Twilio manda form-urlencoded
     msg_in_raw = (request.form.get("Body") or "").strip()
     from_phone = (request.form.get("From") or "").strip()
 
-    # LOG CLAVE: si no ves esto en Render, Twilio NO está pegando al endpoint.
     app.logger.info(f"[TWILIO IN] path={request.path} from={from_phone} body={msg_in_raw}")
 
     try:
         if not GOOGLE_SHEET_NAME:
-            app.logger.error("[CONFIG] Falta GOOGLE_SHEET_NAME en variables de entorno.")
+            app.logger.error("[CONFIG] Falta GOOGLE_SHEET_NAME.")
             return twiml("Estamos en mantenimiento (configuración). Intenta de nuevo en unos minutos 🙏")
 
         sh = open_spreadsheet(GOOGLE_SHEET_NAME)
@@ -197,13 +186,13 @@ def whatsapp_webhook():
         estatus = (lead.get("ESTATUS") or "INICIO").strip() or "INICIO"
         nombre  = (lead.get("Nombre") or "").strip()
 
-        # Si está bloqueado por no aceptar aviso
+        # Si está bloqueado por no aceptar aviso, no lo dejes avanzar
         if (lead.get("Bloqueado_Por_No_Aceptar") or "").strip():
             out = get_text(cfg.get("FIN_NO_ACEPTA", {})) or "Sin aviso de privacidad no podemos continuar."
             log(ws_logs, lead_id, "FIN_NO_ACEPTA", msg_in_raw, out, telefono=from_phone, err="blocked")
             return twiml(out)
 
-        # Fuente
+        # Detectar fuente solo si no se había identificado
         fuente_actual = (lead.get("Fuente_Lead") or "DESCONOCIDA").strip()
         if fuente_actual == "DESCONOCIDA":
             fuente_actual = detect_fuente(msg_in_raw)
@@ -216,7 +205,7 @@ def whatsapp_webhook():
 
         msg_opt = normalize_option(msg_in_raw)
 
-        # Atajo "menu"
+        # ===== Atajo "menu" =====
         if msg_in_raw.strip().lower() in ("menu", "menú"):
             if (lead.get("Procesar_AI_Status") or "").strip().upper() == "DONE":
                 update_row_cells(ws_leads, lead_row, {"ESTATUS": "CLIENTE_MENU"}, hmap=h)
@@ -225,7 +214,7 @@ def whatsapp_webhook():
                 log(ws_logs, lead_id, "CLIENTE_MENU", msg_in_raw, out, telefono=from_phone, err="")
                 return twiml(out)
 
-        # Si estamos en INICIO y no manda 1/2
+        # ===== Si estamos en INICIO y no manda 1/2, mostramos INICIO =====
         if estatus == "INICIO" and msg_opt not in ("1", "2"):
             out = get_text(cfg.get("INICIO", {})) or "Hola, soy Ximena.\n\n1️⃣ Sí\n2️⃣ No"
             out = out.replace("{Nombre}", nombre or "")
@@ -242,7 +231,7 @@ def whatsapp_webhook():
         t = step_type(row_cfg)
         msg_err = render_text(row_cfg.get("Mensaje_Error") or "Por favor responde con una opción válida.")
 
-        # ===== OPCIONES =====
+        # ====== OPCIONES ======
         if t == "OPCIONES":
             valid = [x.strip() for x in (row_cfg.get("Opciones_Validas") or "").split(",") if x.strip()]
             if msg_opt not in valid:
@@ -263,14 +252,14 @@ def whatsapp_webhook():
 
             if nxt == "EN_PROCESO":
                 out = get_text(cfg.get("EN_PROCESO", {})) or "Estoy preparando tu estimación…"
-                q = get_queue()
 
+                q = get_queue()
                 if q is not None:
                     try:
                         from worker_jobs import process_lead
                         update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ENQUEUED"}, hmap=h)
                         q.enqueue(process_lead, lead_id, job_timeout=180)
-                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} cola={REDIS_QUEUE_NAME}")
+                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} en cola={REDIS_QUEUE_NAME}")
                     except Exception as e:
                         app.logger.exception(f"[RQ] No se pudo encolar: {e}")
                         update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ERROR_ENQUEUE"}, hmap=h)
@@ -287,10 +276,11 @@ def whatsapp_webhook():
             log(ws_logs, lead_id, nxt, msg_in_raw, out, telefono=from_phone, err="")
             return twiml(out)
 
-        # ===== TEXTO =====
+        # ====== TEXTO ======
         if t == "TEXTO":
             regla = (row_cfg.get("Regla_Validacion") or "").strip()
             ok = True
+
             if regla.upper() == "MONEY":
                 ok = bool(re.fullmatch(r"\d{1,12}", msg_in_raw.strip()))
             elif regla.upper().startswith("REGEX:"):
@@ -319,7 +309,7 @@ def whatsapp_webhook():
             log(ws_logs, lead_id, nxt, msg_in_raw, out, telefono=from_phone, err="")
             return twiml(out)
 
-        # ===== SISTEMA =====
+        # ====== SISTEMA ======
         out = get_text(row_cfg) or "Gracias."
         out = out.replace("{Nombre}", nombre or "")
         log(ws_logs, lead_id, estatus, msg_in_raw, out, telefono=from_phone, err="system_step")
@@ -329,9 +319,6 @@ def whatsapp_webhook():
         app.logger.exception(f"[ERROR] webhook exception: {e}")
         return twiml("Perdón, tuve un problema técnico 🙏\nIntenta de nuevo en un momento.")
 
-# =========================
-# Reporte web
-# =========================
 @app.get("/reporte")
 def reporte():
     token = (request.args.get("token") or "").strip()
