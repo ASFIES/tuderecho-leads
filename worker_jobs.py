@@ -257,16 +257,17 @@ def process_lead(lead_id: str):
             tnorm = "".join([c for c in abogado_tel if c.isdigit() or c == "+"])
             if tnorm:
                 link_abog = f"https://wa.me/{tnorm.replace('+','')}"
-
-        mensaje_final = (
-            f"✅ {nombre}, ya tengo una *estimación preliminar*.\n\n"
-            f"{resumen}\n\n"
-            f"{estimacion}\n\n"
-            f"👩‍⚖️ La abogada que acompañará tu caso será: *{abogado_nombre}*.\n"
-            "Te contactaremos lo antes posible para revisar detalles.\n\n"
-            + (f"📄 Reporte en web: {link_reporte}\n\n" if link_reporte else "")
-            "Si quieres, escribe *menu* para ver opciones."
+        # Busca esta línea (aprox. 262) y reemplázala:
+    mensaje_final = (
+        f"✅ {nombre}, ya tengo una *estimación preliminar*.\n\n"
+        f"{resumen}\n\n"
+        f"{estimacion}\n\n"
+        f"👩‍⚖️ La abogada que acompañará tu caso será: *{abogado_nombre}*.\n"
+        "Te contactaremos lo antes posible para revisar detalles.\n\n"
+       + (f"📄 Reporte en web: {link_reporte}\n\n" if link_reporte else "")
+       + "Si quieres, escribe *menu* para ver opciones."
         )
+      
 
         update_row_cells(ws_leads, row, {
             "Resultado_Calculo": estimacion,
