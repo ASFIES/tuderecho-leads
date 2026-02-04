@@ -20,6 +20,9 @@ from utils.sheets import (
 )
 from utils.text import normalize_option, render_text, detect_fuente
 
+# =========================
+# Timezone / ENV
+# =========================
 MX_TZ = ZoneInfo(os.environ.get("TZ", "America/Mexico_City").strip() or "America/Mexico_City")
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "").strip()
@@ -34,13 +37,16 @@ REDIS_QUEUE_NAME = os.environ.get("REDIS_QUEUE_NAME", "ximena").strip()
 
 app = Flask(__name__)
 
+# =========================
+# Helpers
+# =========================
 def now_iso():
     return datetime.now(MX_TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 def twiml(text: str) -> Response:
     resp = MessagingResponse()
     resp.message(text)
-    return Response(str(resp), mimetype="application/xml")
+    return Response(str(resp), mimetype="text/xml")
 
 def get_queue():
     """Devuelve Queue si REDIS_URL existe; si no, None."""
@@ -73,7 +79,15 @@ def log(ws_logs, lead_id, paso, msg_in, msg_out, telefono="", err=""):
         pass
 
 def load_config(ws_config):
-    rows = with_backoff(ws_config.get_all_records)
+    """
+    Carga Config_XimenaAI, evitando que gspread convierta a int/float (numericise).
+    """
+    try:
+        rows = with_backoff(ws_config.get_all_records, numericise_ignore=["all"])
+    except TypeError:
+        # si tu versión no soporta numericise_ignore
+        rows = with_backoff(ws_config.get_all_records)
+
     cfg = {}
     for r in rows:
         pid = (r.get("ID_Paso") or "").strip()
@@ -96,6 +110,25 @@ def next_for_option(cfg_row, opt: str) -> str:
     if opt == "2":
         return (cfg_row.get("Siguiente_Si_2") or "").strip()
     return ""
+
+def _parse_opciones_validas(v) -> list:
+    """
+    Acepta:
+    - "1,2,3"
+    - 2  -> ["1","2"]
+    - 3  -> ["1","2","3"]
+    """
+    if v is None:
+        return []
+    if isinstance(v, (int, float)):
+        n = int(v)
+        if 1 <= n <= 20:
+            return [str(i) for i in range(1, n + 1)]
+        return [str(n)]
+    s = str(v).strip()
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
 
 def ensure_lead(ws_leads, from_phone: str):
     phone_norm = re.sub(r"\D+", "", (from_phone or "").replace("whatsapp:", ""))
@@ -143,6 +176,9 @@ def read_lead_row(ws_leads, row_num: int, hmap):
         d[k] = (vals[idx-1] if idx-1 < len(vals) else "").strip()
     return d
 
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def home():
     return {
@@ -156,7 +192,6 @@ def home():
 def health():
     return {"ok": True, "ts": now_iso()}
 
-# Alias por si Twilio quedó apuntando al root "/"
 @app.post("/")
 def whatsapp_root_alias():
     return whatsapp_webhook()
@@ -186,13 +221,13 @@ def whatsapp_webhook():
         estatus = (lead.get("ESTATUS") or "INICIO").strip() or "INICIO"
         nombre  = (lead.get("Nombre") or "").strip()
 
-        # Si está bloqueado por no aceptar aviso, no lo dejes avanzar
+        # Bloqueo por no aceptar aviso
         if (lead.get("Bloqueado_Por_No_Aceptar") or "").strip():
             out = get_text(cfg.get("FIN_NO_ACEPTA", {})) or "Sin aviso de privacidad no podemos continuar."
             log(ws_logs, lead_id, "FIN_NO_ACEPTA", msg_in_raw, out, telefono=from_phone, err="blocked")
             return twiml(out)
 
-        # Detectar fuente solo si no se había identificado
+        # Fuente
         fuente_actual = (lead.get("Fuente_Lead") or "DESCONOCIDA").strip()
         if fuente_actual == "DESCONOCIDA":
             fuente_actual = detect_fuente(msg_in_raw)
@@ -205,16 +240,7 @@ def whatsapp_webhook():
 
         msg_opt = normalize_option(msg_in_raw)
 
-        # ===== Atajo "menu" =====
-        if msg_in_raw.strip().lower() in ("menu", "menú"):
-            if (lead.get("Procesar_AI_Status") or "").strip().upper() == "DONE":
-                update_row_cells(ws_leads, lead_row, {"ESTATUS": "CLIENTE_MENU"}, hmap=h)
-                out = get_text(cfg.get("CLIENTE_MENU", {})) or "Menú:\n1 Fechas\n2 Resumen\n3 Abogada"
-                out = out.replace("{Nombre}", nombre or "")
-                log(ws_logs, lead_id, "CLIENTE_MENU", msg_in_raw, out, telefono=from_phone, err="")
-                return twiml(out)
-
-        # ===== Si estamos en INICIO y no manda 1/2, mostramos INICIO =====
+        # Si está en INICIO y no manda 1/2 -> manda INICIO
         if estatus == "INICIO" and msg_opt not in ("1", "2"):
             out = get_text(cfg.get("INICIO", {})) or "Hola, soy Ximena.\n\n1️⃣ Sí\n2️⃣ No"
             out = out.replace("{Nombre}", nombre or "")
@@ -228,12 +254,16 @@ def whatsapp_webhook():
             log(ws_logs, lead_id, "INICIO", msg_in_raw, out, telefono=from_phone, err="missing_step")
             return twiml(out)
 
-        t = step_type(row_cfg)
+        t = step_type(row_cfg) or "OPCIONES"
         msg_err = render_text(row_cfg.get("Mensaje_Error") or "Por favor responde con una opción válida.")
 
         # ====== OPCIONES ======
         if t == "OPCIONES":
-            valid = [x.strip() for x in (row_cfg.get("Opciones_Validas") or "").split(",") if x.strip()]
+            valid = _parse_opciones_validas(row_cfg.get("Opciones_Validas"))
+            # si no definieron nada, por defecto 1/2
+            if not valid:
+                valid = ["1", "2"]
+
             if msg_opt not in valid:
                 log(ws_logs, lead_id, estatus, msg_in_raw, msg_err, telefono=from_phone, err="invalid_option")
                 return twiml(msg_err)
@@ -245,11 +275,13 @@ def whatsapp_webhook():
             if campo:
                 upd[campo] = msg_opt
 
+            # Rechazó aviso
             if estatus == "AVISO_PRIVACIDAD" and msg_opt == "2":
                 upd["Bloqueado_Por_No_Aceptar"] = "SI"
 
             update_row_cells(ws_leads, lead_row, upd, hmap=h)
 
+            # EN_PROCESO (opcional Redis)
             if nxt == "EN_PROCESO":
                 out = get_text(cfg.get("EN_PROCESO", {})) or "Estoy preparando tu estimación…"
 
@@ -259,7 +291,7 @@ def whatsapp_webhook():
                         from worker_jobs import process_lead
                         update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ENQUEUED"}, hmap=h)
                         q.enqueue(process_lead, lead_id, job_timeout=180)
-                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} en cola={REDIS_QUEUE_NAME}")
+                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} cola={REDIS_QUEUE_NAME}")
                     except Exception as e:
                         app.logger.exception(f"[RQ] No se pudo encolar: {e}")
                         update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ERROR_ENQUEUE"}, hmap=h)
@@ -280,7 +312,6 @@ def whatsapp_webhook():
         if t == "TEXTO":
             regla = (row_cfg.get("Regla_Validacion") or "").strip()
             ok = True
-
             if regla.upper() == "MONEY":
                 ok = bool(re.fullmatch(r"\d{1,12}", msg_in_raw.strip()))
             elif regla.upper().startswith("REGEX:"):
@@ -319,6 +350,9 @@ def whatsapp_webhook():
         app.logger.exception(f"[ERROR] webhook exception: {e}")
         return twiml("Perdón, tuve un problema técnico 🙏\nIntenta de nuevo en un momento.")
 
+# =========================
+# Reporte web
+# =========================
 @app.get("/reporte")
 def reporte():
     token = (request.args.get("token") or "").strip()
