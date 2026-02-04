@@ -5,7 +5,7 @@ import time
 import json
 import base64
 import ast
-from typing import Any, Dict, Optional, List, Callable, Tuple
+from typing import Any, Dict, Optional, List, Callable
 
 import gspread
 from gspread.cell import Cell
@@ -20,26 +20,20 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Cache global (evita re-autenticar por cada request)
 _GSPREAD_CLIENT: Optional[gspread.Client] = None
 
 
 # =========================
-# Backoff helper
+# Backoff
 # =========================
 def with_backoff(fn: Callable, *args, retries: int = 6, base_sleep: float = 0.6, **kwargs):
-    """
-    Reintenta llamadas a Google API / gspread con backoff exponencial.
-    """
     last_err = None
     for i in range(retries):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             last_err = e
-            # Backoff exponencial con jitter simple
-            sleep_s = base_sleep * (2 ** i)
-            time.sleep(min(sleep_s, 6.0))
+            time.sleep(min(base_sleep * (2 ** i), 6.0))
     raise last_err
 
 
@@ -47,13 +41,11 @@ def with_backoff(fn: Callable, *args, retries: int = 6, base_sleep: float = 0.6,
 # Credentials parsing
 # =========================
 def _looks_like_base64(s: str) -> bool:
-    s = s.strip()
+    s = (s or "").strip()
     if len(s) < 40:
         return False
-    # “eyJ” suele ser JSON en base64 ({" ... })
-    if s.startswith("eyJ"):
+    if s.startswith("eyJ"):  # típico JSON base64
         return True
-    # heurística: solo charset base64 y múltiplo aproximado
     if re.fullmatch(r"[A-Za-z0-9+/=\s]+", s) and ("{" not in s):
         return True
     return False
@@ -61,7 +53,7 @@ def _looks_like_base64(s: str) -> bool:
 
 def _try_b64_decode(raw: str) -> Optional[str]:
     try:
-        b = base64.b64decode(raw.strip())
+        b = base64.b64decode((raw or "").strip())
         return b.decode("utf-8", errors="strict")
     except Exception:
         return None
@@ -69,9 +61,10 @@ def _try_b64_decode(raw: str) -> Optional[str]:
 
 def _unescape_if_needed(raw: str) -> str:
     """
-    Si viene con secuencias escapadas tipo \" o \\n o \\' las convertimos.
+    Convierte secuencias escapadas \" \\n \\' a caracteres reales.
     """
-    if any(x in raw for x in ('\\n', '\\"', "\\'")):
+    raw = raw or ""
+    if any(x in raw for x in ("\\n", '\\"', "\\'")):
         try:
             return bytes(raw, "utf-8").decode("unicode_escape")
         except Exception:
@@ -79,33 +72,59 @@ def _unescape_if_needed(raw: str) -> str:
     return raw
 
 
+def _normalize_private_key(info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Asegura que private_key sea PEM válido con saltos reales.
+    """
+    pk = info.get("private_key")
+    if not pk or not isinstance(pk, str):
+        raise RuntimeError(
+            "Credenciales inválidas: falta 'private_key' en GOOGLE_CREDENTIALS_JSON. "
+            "Asegúrate de pegar el JSON de *Service Account* (no OAuth client)."
+        )
+
+    pk = pk.strip()
+
+    # Caso común: quedó con \\n literal
+    if "\\n" in pk:
+        pk = pk.replace("\\n", "\n")
+
+    # Caso: PEM aplastado (sin saltos)
+    if "-----BEGIN PRIVATE KEY-----" in pk and "-----END PRIVATE KEY-----" in pk and "\n" not in pk:
+        pk = pk.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+        pk = pk.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----\n")
+
+    # Validación mínima
+    if "-----BEGIN PRIVATE KEY-----" not in pk:
+        raise RuntimeError(
+            "private_key no parece PEM válido (no contiene 'BEGIN PRIVATE KEY'). "
+            "Esto ocurre cuando el JSON se pegó incompleto o modificado en Render."
+        )
+
+    info["private_key"] = pk
+    return info
+
+
 def _parse_service_account(raw: str) -> Dict[str, Any]:
-    """
-    Acepta:
-    - JSON normal (con comillas dobles)
-    - dict estilo Python (comillas simples)
-    - JSON/dict escapado (\\", \\' , \\n)
-    - Base64 de JSON
-    """
     if not raw or not raw.strip():
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON está vacío.")
 
     raw0 = raw.strip()
 
-    # 1) Si parece base64, intentar decode
+    # 1) Base64 (opcional)
     if _looks_like_base64(raw0):
         dec = _try_b64_decode(raw0)
         if dec:
             raw0 = dec.strip()
 
-    # 2) Si viene envuelto en comillas externas
+    # 2) Quitar comillas externas si las trae
     if (raw0.startswith('"') and raw0.endswith('"')) or (raw0.startswith("'") and raw0.endswith("'")):
         raw0 = raw0[1:-1].strip()
 
-    # 3) Des-escapar si tiene \", \n, \'
+    # 3) Des-escapar si aplica
     raw1 = _unescape_if_needed(raw0)
 
-    # 4) Intentar JSON directo
+    # 4) Intentar JSON
     try:
         data = json.loads(raw1)
         if isinstance(data, dict):
@@ -113,10 +132,9 @@ def _parse_service_account(raw: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 5) Reparación común: quitar backslashes antes de comillas
+    # 5) Reparación común
     raw2 = raw1.replace("\\'", "'").replace('\\"', '"')
 
-    # 6) Intentar JSON otra vez
     try:
         data = json.loads(raw2)
         if isinstance(data, dict):
@@ -124,27 +142,22 @@ def _parse_service_account(raw: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 7) Intentar dict estilo Python
+    # 6) Dict estilo Python
     try:
         data = ast.literal_eval(raw2)
         if isinstance(data, dict):
             return data
     except Exception as e:
-        # diagnóstico útil
         snippet = raw2[:220].replace("\n", "\\n")
         raise RuntimeError(
-            "GOOGLE_CREDENTIALS_JSON no es JSON válido ni dict Python válido.\n"
-            "TIP: Pega el JSON del service account tal cual (con comillas dobles) en Render.\n"
+            "GOOGLE_CREDENTIALS_JSON no se pudo parsear como JSON.\n"
+            "TIP: pega el JSON del service account tal cual (con comillas dobles).\n"
             f"Detalle parse: {e}\n"
             f"Inicio del valor: {snippet}"
         )
 
 
 def _load_service_account_info() -> Dict[str, Any]:
-    """
-    Lee credenciales desde env.
-    Soporta varios nombres por compatibilidad.
-    """
     raw = (
         os.environ.get("GOOGLE_CREDENTIALS_JSON")
         or os.environ.get("GOOGLE_CREDENTIALS")
@@ -155,22 +168,19 @@ def _load_service_account_info() -> Dict[str, Any]:
 
     info = _parse_service_account(raw)
 
-    # Validación mínima (sin romper si falta algo no crítico)
-    if not isinstance(info, dict):
-        raise RuntimeError("Credenciales inválidas: no es objeto/dict.")
+    # Validación/normalización de llave
+    info = _normalize_private_key(info)
 
-    # Campos típicos de service_account
-    if "type" in info and str(info["type"]).strip() != "service_account":
-        # no lo hacemos fatal, pero avisaría
-        pass
+    # Campos típicos requeridos por google-auth
+    for k in ("client_email", "token_uri"):
+        if not info.get(k):
+            raise RuntimeError(f"Credenciales inválidas: falta '{k}' en GOOGLE_CREDENTIALS_JSON.")
 
-    # Si private_key trae saltos reales de línea dentro de la cadena (mal pegado),
-    # suele romper JSON antes. Aquí ya parseó, así que normalmente viene bien con \n.
     return info
 
 
 # =========================
-# Gspread client
+# Gspread
 # =========================
 def get_gspread_client() -> gspread.Client:
     global _GSPREAD_CLIENT
@@ -184,14 +194,8 @@ def get_gspread_client() -> gspread.Client:
 
 
 def open_spreadsheet(sheet_name_or_key: str):
-    """
-    Abre spreadsheet por:
-    - Título (nombre)
-    - Key (id)
-    - URL completa
-    """
     if not sheet_name_or_key or not sheet_name_or_key.strip():
-        raise RuntimeError("Falta GOOGLE_SHEET_NAME (o el nombre/id del spreadsheet).")
+        raise RuntimeError("Falta GOOGLE_SHEET_NAME (nombre/id del spreadsheet).")
 
     s = sheet_name_or_key.strip()
 
@@ -203,11 +207,10 @@ def open_spreadsheet(sheet_name_or_key: str):
 
     gc = get_gspread_client()
 
-    # Si parece key (id), abrir por key
+    # Si parece key, abrir por key
     if re.fullmatch(r"[a-zA-Z0-9-_]{25,}", s):
         return with_backoff(gc.open_by_key, s)
 
-    # Si no, asumir título
     return with_backoff(gc.open, s)
 
 
@@ -218,12 +221,9 @@ def open_worksheet(spreadsheet, tab_name: str):
 
 
 # =========================
-# Sheet utilities
+# Sheet utils
 # =========================
 def build_header_map(ws) -> Dict[str, int]:
-    """
-    Retorna {header: col_index(1-based)}
-    """
     headers = with_backoff(ws.row_values, 1)
     hmap: Dict[str, int] = {}
     for i, h in enumerate(headers, start=1):
@@ -255,10 +255,6 @@ def row_to_dict(headers: List[str], row: List[str]) -> Dict[str, str]:
 
 
 def find_row_by_col_value(values: List[List[str]], col_name: str, value: str) -> Optional[int]:
-    """
-    values: matriz completa (incluye headers en values[0])
-    Retorna índice de fila (0-based) dentro de values si encuentra, si no None.
-    """
     if not values or len(values) < 2:
         return None
     headers = values[0]
@@ -277,9 +273,6 @@ def find_row_by_col_value(values: List[List[str]], col_name: str, value: str) ->
 
 
 def find_row_by_value(ws, col_name: str, value: str, hmap: Optional[Dict[str, int]] = None) -> Optional[int]:
-    """
-    Busca fila (1-based en Google Sheets) donde col_name == value
-    """
     if hmap is None:
         hmap = build_header_map(ws)
 
@@ -292,7 +285,7 @@ def find_row_by_value(ws, col_name: str, value: str, hmap: Optional[Dict[str, in
         return None
 
     target = (value or "").strip()
-    for r_i in range(2, len(values) + 1):  # 1-based row, empezando en 2
+    for r_i in range(2, len(values) + 1):
         row = values[r_i - 1]
         cell = (row[c - 1] if (c - 1) < len(row) else "").strip()
         if cell == target:
@@ -301,10 +294,6 @@ def find_row_by_value(ws, col_name: str, value: str, hmap: Optional[Dict[str, in
 
 
 def update_row_cells(ws, row_num: int, updates: Dict[str, Any], hmap: Optional[Dict[str, int]] = None):
-    """
-    Actualiza múltiples celdas de una misma fila en 1 sola llamada (update_cells).
-    updates: {"ColHeader": "valor", ...}
-    """
     if not updates:
         return
 
@@ -322,14 +311,3 @@ def update_row_cells(ws, row_num: int, updates: Dict[str, Any], hmap: Optional[D
         return
 
     with_backoff(ws.update_cells, cells, value_input_option="USER_ENTERED")
-
-
-def find_row_by_col_value_ws(ws, col_name: str, value: str) -> Optional[int]:
-    """
-    Variante que opera directo con ws.
-    """
-    values = get_all_values_safe(ws)
-    idx0 = find_row_by_col_value(values, col_name, value)
-    if idx0 is None:
-        return None
-    return idx0 + 1  # convertir a row_num 1-based
