@@ -64,6 +64,12 @@ def read_sys_config(ws_sys) -> dict:
     return out
 
 def pick_abogado(ws_abog, salario_mensual: float):
+    """
+    Regla:
+    - salario >= 50,000 => intenta A01 (si Activo)
+    - si no, el activo con menor Leads_Asignados_Hoy
+    - si no hay activos, fallback A01 (aunque esté vacío)
+    """
     h = build_header_map(ws_abog)
     rows = with_backoff(ws_abog.get_all_values)
     if not rows or len(rows) < 2:
@@ -77,7 +83,6 @@ def pick_abogado(ws_abog, salario_mensual: float):
         v = cell(r, "Activo").upper()
         return v in ("SI", "SÍ", "TRUE", "1")
 
-    # regla VIP por salario
     if salario_mensual >= 50000:
         for r in rows[1:]:
             if cell(r, "ID_Abogado") == "A01" and is_active(r):
@@ -101,7 +106,6 @@ def pick_abogado(ws_abog, salario_mensual: float):
         aid = cell(r, "ID_Abogado")
         return (aid, cell(r, "Nombre_Abogado") or f"Abogada {aid}", cell(r, "Telefono_Abogado"))
 
-    # fallback A01 aunque no esté Activo
     for r in rows[1:]:
         if cell(r, "ID_Abogado") == "A01":
             return ("A01", cell(r, "Nombre_Abogado") or "Abogada A01", cell(r, "Telefono_Abogado"))
@@ -113,6 +117,7 @@ def years_of_service(ini: date, fin: date) -> float:
     return days / 365.0 if days else 0.0
 
 def vacation_days_by_years(y: int) -> int:
+    # Vacaciones dignas (aprox)
     if y <= 0:
         return 0
     if y == 1: return 12
@@ -144,7 +149,6 @@ def calc_estimacion(tipo_caso: str, salario_mensual: float, ini: date, fin: date
         ind_3m = sd * 90
         ind_20 = sd * 20 * y
         total = ind_3m + ind_20 + aguinaldo_prop + vacaciones_prop + prima_vac_prop
-
         return (
             "📌 *Estimación preliminar (informativa)*\n"
             f"• Antigüedad estimada: {y:.2f} años\n"
@@ -203,6 +207,14 @@ def _parse_date_parts(h, vals, prefix: str) -> date:
     return date(y, m, d)
 
 def process_lead(lead_id: str):
+    """
+    Job RQ:
+    - Lee lead por ID_Lead
+    - Calcula estimación + resumen
+    - Asigna abogada
+    - Escribe resultados en BD_Leads
+    - Envía WhatsApp (resultado + menú)
+    """
     if not GOOGLE_SHEET_NAME:
         raise RuntimeError("Falta GOOGLE_SHEET_NAME.")
 
@@ -222,6 +234,7 @@ def process_lead(lead_id: str):
         c = col_idx(h, name)
         return (vals[c-1] if c and c-1 < len(vals) else "").strip()
 
+    # Marca como corriendo
     update_row_cells(ws_leads, row, {
         "Procesar_AI_Status": "RUNNING",
         "Ultimo_Error": "",
@@ -257,18 +270,20 @@ def process_lead(lead_id: str):
             tnorm = "".join([c for c in abogado_tel if c.isdigit() or c == "+"])
             if tnorm:
                 link_abog = f"https://wa.me/{tnorm.replace('+','')}"
-        # Busca esta línea (aprox. 262) y reemplázala:
-    mensaje_final = (
-        f"✅ {nombre}, ya tengo una *estimación preliminar*.\n\n"
-        f"{resumen}\n\n"
-        f"{estimacion}\n\n"
-        f"👩‍⚖️ La abogada que acompañará tu caso será: *{abogado_nombre}*.\n"
-        "Te contactaremos lo antes posible para revisar detalles.\n\n"
-       + (f"📄 Reporte en web: {link_reporte}\n\n" if link_reporte else "")
-       + "Si quieres, escribe *menu* para ver opciones."
-        )
-      
 
+        # Mensaje (seguro, sin concatenaciones frágiles)
+        mensaje_final = (
+            f"✅ {nombre}, ya tengo una *estimación preliminar*.\n\n"
+            f"{resumen}\n\n"
+            f"{estimacion}\n\n"
+            f"👩‍⚖️ La abogada que acompañará tu caso será: *{abogado_nombre}*.\n"
+            "Te contactaremos lo antes posible para revisar detalles.\n\n"
+        )
+        if link_reporte:
+            mensaje_final += f"📄 Reporte en web: {link_reporte}\n\n"
+        mensaje_final += "Si quieres, escribe *menu* para ver opciones."
+
+        # Guarda resultados
         update_row_cells(ws_leads, row, {
             "Resultado_Calculo": estimacion,
             "Analisis_AI": resumen,
@@ -283,8 +298,10 @@ def process_lead(lead_id: str):
             "Link_WhatsApp": link_abog,
         }, hmap=h)
 
+        # Envía WhatsApp al cliente
         send_whatsapp(telefono, mensaje_final)
 
+        # Envía menú final
         menu = (
             f"Hola {nombre} 👋 Estoy contigo.\n\n"
             "¿Qué opción deseas?\n"
