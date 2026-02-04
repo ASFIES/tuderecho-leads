@@ -101,7 +101,7 @@ def pick_abogado(ws_abog, salario_mensual: float):
         aid = cell(r, "ID_Abogado")
         return (aid, cell(r, "Nombre_Abogado") or f"Abogada {aid}", cell(r, "Telefono_Abogado"))
 
-    # fallback: A01 aunque no esté marcado activo
+    # fallback A01 aunque no esté Activo
     for r in rows[1:]:
         if cell(r, "ID_Abogado") == "A01":
             return ("A01", cell(r, "Nombre_Abogado") or "Abogada A01", cell(r, "Telefono_Abogado"))
@@ -123,7 +123,7 @@ def vacation_days_by_years(y: int) -> int:
     extra_blocks = (y - 6) // 5 + 1
     return 20 + 2 * extra_blocks
 
-def calc_estimacion(tipo_caso: str, salario_mensual: float, ini: date, fin: date):
+def calc_estimacion(tipo_caso: str, salario_mensual: float, ini: date, fin: date) -> str:
     sd = salario_mensual / 30.0 if salario_mensual else 0.0
     y = years_of_service(ini, fin)
     y_int = max(int(y), 1) if y > 0 else 0
@@ -143,7 +143,6 @@ def calc_estimacion(tipo_caso: str, salario_mensual: float, ini: date, fin: date
     if str(tipo_caso).strip() == "1":
         ind_3m = sd * 90
         ind_20 = sd * 20 * y
-
         total = ind_3m + ind_20 + aguinaldo_prop + vacaciones_prop + prima_vac_prop
 
         return (
@@ -161,8 +160,8 @@ def calc_estimacion(tipo_caso: str, salario_mensual: float, ini: date, fin: date
     total = aguinaldo_prop + vacaciones_prop + prima_vac_prop
     return (
         "📌 *Estimación preliminar (informativa)*\n"
-        "En renuncia normalmente procede *finiquito*: salario pendiente (si existiera), aguinaldo proporcional, "
-        "vacaciones no gozadas/proporcionales y prima vacacional.\n\n"
+        "En renuncia normalmente procede *finiquito*: aguinaldo proporcional, "
+        "vacaciones proporcionales/no gozadas y prima vacacional (más pagos pendientes si existieran).\n\n"
         f"• Aguinaldo proporcional (aprox): ${aguinaldo_prop:,.2f}\n"
         f"• Vacaciones proporcionales (aprox): ${vacaciones_prop:,.2f}\n"
         f"• Prima vacacional (aprox): ${prima_vac_prop:,.2f}\n"
@@ -170,12 +169,12 @@ def calc_estimacion(tipo_caso: str, salario_mensual: float, ini: date, fin: date
         "Nota: puede variar según recibos, prestaciones reales y pagos pendientes."
     )
 
-def build_resumen_largo(tipo_caso: str, nombre: str):
+def build_resumen_largo(tipo_caso: str, nombre: str) -> str:
     if str(tipo_caso).strip() == "1":
         return (
             f"{nombre}, lamento mucho lo que estás viviendo. Gracias por contarnos tu situación.\n\n"
             "📌 *Lo más importante:* tus derechos laborales importan y vamos a acompañarte paso a paso.\n\n"
-            "En términos generales, ante un despido el patrón debe acreditar una causa legal y cumplir formalidades. "
+            "En términos generales, ante un despido el patrón debe acreditar causa legal y cumplir formalidades. "
             "Cuando no se acredita, normalmente se reclama indemnización o reinstalación, además de prestaciones pendientes.\n\n"
             "⚖️ Esta orientación es *informativa* (no es asesoría legal). Una abogada revisará tu caso con detalle."
         )
@@ -204,6 +203,9 @@ def _parse_date_parts(h, vals, prefix: str) -> date:
     return date(y, m, d)
 
 def process_lead(lead_id: str):
+    if not GOOGLE_SHEET_NAME:
+        raise RuntimeError("Falta GOOGLE_SHEET_NAME.")
+
     sh = open_spreadsheet(GOOGLE_SHEET_NAME)
     ws_leads = open_worksheet(sh, TAB_LEADS)
     ws_abog  = open_worksheet(sh, TAB_ABOG)
@@ -220,11 +222,10 @@ def process_lead(lead_id: str):
         c = col_idx(h, name)
         return (vals[c-1] if c and c-1 < len(vals) else "").strip()
 
-    # marcamos RUNNING
     update_row_cells(ws_leads, row, {
         "Procesar_AI_Status": "RUNNING",
         "Ultimo_Error": "",
-        "Ultima_Actualizacion": now_iso()
+        "Ultima_Actualizacion": now_iso(),
     }, hmap=h)
 
     syscfg = read_sys_config(ws_sys)
@@ -232,7 +233,7 @@ def process_lead(lead_id: str):
     try:
         telefono = get("Telefono")
         nombre = get("Nombre") or "Hola"
-        tipo_caso = get("Tipo_Caso")  # "1" despido, "2" renuncia
+        tipo_caso = get("Tipo_Caso")
         salario = money_to_float(get("Salario_Mensual"))
 
         ini = _parse_date_parts(h, vals, "Inicio")
@@ -281,10 +282,8 @@ def process_lead(lead_id: str):
             "Link_WhatsApp": link_abog,
         }, hmap=h)
 
-        # enviar WhatsApp al cliente
         send_whatsapp(telefono, mensaje_final)
 
-        # menú final
         menu = (
             f"Hola {nombre} 👋 Estoy contigo.\n\n"
             "¿Qué opción deseas?\n"
@@ -298,18 +297,9 @@ def process_lead(lead_id: str):
         return {"ok": True, "lead_id": lead_id}
 
     except Exception as e:
-        # guardamos el error para que NO se quede “en el aire”
         update_row_cells(ws_leads, row, {
             "Procesar_AI_Status": "FAILED",
             "Ultimo_Error": f"{type(e).__name__}: {e}",
-            "Ultima_Actualizacion": now_iso()
+            "Ultima_Actualizacion": now_iso(),
         }, hmap=h)
-
-        # intentamos avisar al cliente sin romper todo si Twilio falla
-        try:
-            telefono = get("Telefono")
-            send_whatsapp(telefono, "Perdón 🙏 tuve un problema técnico al generar tu estimación. Ya lo estamos revisando. En breve te contactamos.")
-        except Exception:
-            pass
-
         raise
