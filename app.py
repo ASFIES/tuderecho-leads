@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 
-# Redis (opcional)
 from redis import Redis
 from rq import Queue
 
@@ -79,13 +78,9 @@ def log(ws_logs, lead_id, paso, msg_in, msg_out, telefono="", err=""):
         pass
 
 def load_config(ws_config):
-    """
-    Carga Config_XimenaAI, evitando que gspread convierta a int/float (numericise).
-    """
     try:
         rows = with_backoff(ws_config.get_all_records, numericise_ignore=["all"])
     except TypeError:
-        # si tu versión no soporta numericise_ignore
         rows = with_backoff(ws_config.get_all_records)
 
     cfg = {}
@@ -95,8 +90,28 @@ def load_config(ws_config):
             cfg[pid] = r
     return cfg
 
-def step_type(cfg_row) -> str:
+def step_type_raw(cfg_row) -> str:
     return (cfg_row.get("Tipo_Entrada") or "").strip().upper()
+
+def infer_step_type(cfg_row) -> str:
+    """
+    Si en Sheet se olvidan Tipo_Entrada (como EN_PROCESO), inferimos:
+    - si hay Opciones_Validas o Siguiente_Si_* -> OPCIONES
+    - si hay Regla_Validacion o Campo_BD... -> TEXTO
+    - si no -> SISTEMA
+    """
+    t = step_type_raw(cfg_row)
+    if t:
+        return t
+
+    has_opts = bool((cfg_row.get("Opciones_Validas") or "").strip()) or bool((cfg_row.get("Siguiente_Si_1") or "").strip()) or bool((cfg_row.get("Siguiente_Si_2") or "").strip())
+    has_text = bool((cfg_row.get("Regla_Validacion") or "").strip()) or bool((cfg_row.get("Campo_BD_Leads_A_Actualizar") or "").strip())
+
+    if has_opts:
+        return "OPCIONES"
+    if has_text:
+        return "TEXTO"
+    return "SISTEMA"
 
 def get_text(cfg_row) -> str:
     return render_text(cfg_row.get("Texto_Bot") or "")
@@ -112,12 +127,6 @@ def next_for_option(cfg_row, opt: str) -> str:
     return ""
 
 def _parse_opciones_validas(v) -> list:
-    """
-    Acepta:
-    - "1,2,3"
-    - 2  -> ["1","2"]
-    - 3  -> ["1","2","3"]
-    """
     if v is None:
         return []
     if isinstance(v, (int, float)):
@@ -167,6 +176,9 @@ def ensure_lead(ws_leads, from_phone: str):
 
     with_backoff(ws_leads.append_row, new_row, value_input_option="USER_ENTERED")
     row2 = find_row_by_value(ws_leads, "Telefono_Normalizado", phone_norm, hmap=h)
+    if not row2:
+        # fallback extremo: buscar por ID_Lead recién insertado
+        row2 = find_row_by_value(ws_leads, "ID_Lead", lead_id, hmap=h)
     return row2, lead_id, phone_norm, h
 
 def read_lead_row(ws_leads, row_num: int, hmap):
@@ -190,7 +202,9 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": now_iso()}
+    # health más útil
+    q_ok = bool(get_queue())
+    return {"ok": True, "ts": now_iso(), "redis_configured": bool(REDIS_URL), "queue_ok": q_ok}
 
 @app.post("/")
 def whatsapp_root_alias():
@@ -200,6 +214,7 @@ def whatsapp_root_alias():
 def whatsapp_webhook():
     msg_in_raw = (request.form.get("Body") or "").strip()
     from_phone = (request.form.get("From") or "").strip()
+    msg_lower = msg_in_raw.lower().strip()
 
     app.logger.info(f"[TWILIO IN] path={request.path} from={from_phone} body={msg_in_raw}")
 
@@ -216,10 +231,14 @@ def whatsapp_webhook():
         cfg = load_config(ws_cfg)
 
         lead_row, lead_id, phone_norm, h = ensure_lead(ws_leads, from_phone)
+        if not lead_row:
+            return twiml("Perdón, tuve un problema técnico al registrar tu caso 🙏 Intenta de nuevo.")
+
         lead = read_lead_row(ws_leads, lead_row, h)
 
         estatus = (lead.get("ESTATUS") or "INICIO").strip() or "INICIO"
         nombre  = (lead.get("Nombre") or "").strip()
+        procesar_status = (lead.get("Procesar_AI_Status") or "").strip().upper()
 
         # Bloqueo por no aceptar aviso
         if (lead.get("Bloqueado_Por_No_Aceptar") or "").strip():
@@ -227,7 +246,7 @@ def whatsapp_webhook():
             log(ws_logs, lead_id, "FIN_NO_ACEPTA", msg_in_raw, out, telefono=from_phone, err="blocked")
             return twiml(out)
 
-        # Fuente
+        # Fuente (solo si aún es desconocida)
         fuente_actual = (lead.get("Fuente_Lead") or "DESCONOCIDA").strip()
         if fuente_actual == "DESCONOCIDA":
             fuente_actual = detect_fuente(msg_in_raw)
@@ -237,6 +256,21 @@ def whatsapp_webhook():
             "Fuente_Lead": fuente_actual,
             "Ultima_Actualizacion": now_iso()
         }, hmap=h)
+
+        # Comando "menu"
+        if msg_lower == "menu":
+            # si ya hay resultado, mandamos menú
+            if (lead.get("Abogado_Asignado_ID") or "").strip() or procesar_status == "DONE":
+                update_row_cells(ws_leads, lead_row, {"ESTATUS": "CLIENTE_MENU"}, hmap=h)
+                out = get_text(cfg.get("CLIENTE_MENU", {})) or f"Hola {nombre} 👋\n1️⃣ Próximas fechas\n2️⃣ Resumen\n3️⃣ Contactar a mi abogada"
+                out = out.replace("{Nombre}", nombre or "")
+                log(ws_logs, lead_id, "CLIENTE_MENU", msg_in_raw, out, telefono=from_phone, err="")
+                return twiml(out)
+            # si está en proceso, no lo castigamos con invalid_option
+            if estatus == "EN_PROCESO":
+                out = "Sigo preparando tu estimación ✅\nEn cuanto termine te envío el resultado por aquí."
+                log(ws_logs, lead_id, "EN_PROCESO", msg_in_raw, out, telefono=from_phone, err="still_processing")
+                return twiml(out)
 
         msg_opt = normalize_option(msg_in_raw)
 
@@ -254,17 +288,22 @@ def whatsapp_webhook():
             log(ws_logs, lead_id, "INICIO", msg_in_raw, out, telefono=from_phone, err="missing_step")
             return twiml(out)
 
-        t = step_type(row_cfg) or "OPCIONES"
+        t = infer_step_type(row_cfg)
         msg_err = render_text(row_cfg.get("Mensaje_Error") or "Por favor responde con una opción válida.")
 
         # ====== OPCIONES ======
         if t == "OPCIONES":
             valid = _parse_opciones_validas(row_cfg.get("Opciones_Validas"))
-            # si no definieron nada, por defecto 1/2
             if not valid:
                 valid = ["1", "2"]
 
             if msg_opt not in valid:
+                # excepción: si está en EN_PROCESO no lo castigamos
+                if estatus == "EN_PROCESO":
+                    out = "Sigo preparando tu estimación ✅\nEn cuanto termine te envío el resultado por aquí."
+                    log(ws_logs, lead_id, "EN_PROCESO", msg_in_raw, out, telefono=from_phone, err="still_processing")
+                    return twiml(out)
+
                 log(ws_logs, lead_id, estatus, msg_in_raw, msg_err, telefono=from_phone, err="invalid_option")
                 return twiml(msg_err)
 
@@ -289,14 +328,26 @@ def whatsapp_webhook():
                 if q is not None:
                     try:
                         from worker_jobs import process_lead
-                        update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ENQUEUED"}, hmap=h)
-                        q.enqueue(process_lead, lead_id, job_timeout=180)
-                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} cola={REDIS_QUEUE_NAME}")
+                        job = q.enqueue(process_lead, lead_id, job_timeout=180)
+                        update_row_cells(ws_leads, lead_row, {
+                            "Procesar_AI_Status": "ENQUEUED",
+                            "RQ_Job_ID": job.get_id(),
+                            "Ultimo_Error": ""
+                        }, hmap=h)
+                        app.logger.info(f"[RQ] Encolado lead_id={lead_id} job_id={job.get_id()} cola={REDIS_QUEUE_NAME}")
                     except Exception as e:
                         app.logger.exception(f"[RQ] No se pudo encolar: {e}")
-                        update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "ERROR_ENQUEUE"}, hmap=h)
+                        update_row_cells(ws_leads, lead_row, {
+                            "Procesar_AI_Status": "ERROR_ENQUEUE",
+                            "Ultimo_Error": f"ENQUEUE_ERROR: {type(e).__name__}: {e}"
+                        }, hmap=h)
+                        # útil: también lo dejamos en Logs
+                        log(ws_logs, lead_id, "EN_PROCESO", msg_in_raw, out, telefono=from_phone, err=f"enqueue_fail: {type(e).__name__}: {e}")
                 else:
-                    update_row_cells(ws_leads, lead_row, {"Procesar_AI_Status": "SKIPPED_NO_REDIS"}, hmap=h)
+                    update_row_cells(ws_leads, lead_row, {
+                        "Procesar_AI_Status": "SKIPPED_NO_REDIS",
+                        "Ultimo_Error": "NO_REDIS_CONFIGURED"
+                    }, hmap=h)
 
                 out = out.replace("{Nombre}", nombre or "")
                 log(ws_logs, lead_id, "EN_PROCESO", msg_in_raw, out, telefono=from_phone, err="")
@@ -341,6 +392,7 @@ def whatsapp_webhook():
             return twiml(out)
 
         # ====== SISTEMA ======
+        # En SISTEMA NO validamos opciones.
         out = get_text(row_cfg) or "Gracias."
         out = out.replace("{Nombre}", nombre or "")
         log(ws_logs, lead_id, estatus, msg_in_raw, out, telefono=from_phone, err="system_step")

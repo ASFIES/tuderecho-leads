@@ -13,16 +13,11 @@ def render_text(s: str) -> str:
         s = s[1:-1]
     return s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").strip()
 
-def template_fill(template: str, lead: Dict[str, str]) -> str:
-    t = template or ""
-    for k, v in (lead or {}).items():
-        if k:
-            t = t.replace("{" + k + "}", str(v))
-    return t
-
 def detect_fuente(msg: str) -> str:
-    t = (msg or "").lower()
-    if "facebook" in t or "anuncio" in t or "fb" in t:
+    t = (msg or "").lower().strip()
+    if t in ("hola", "test", "prueba"):
+        return "PRUEBA"
+    if "facebook" in t or "anuncio" in t or " fb" in t or t.startswith("fb"):
         return "FACEBOOK"
     if "sitio" in t or "web" in t or "página" in t or "pagina" in t:
         return "WEB"
