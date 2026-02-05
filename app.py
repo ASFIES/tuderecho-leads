@@ -6,7 +6,7 @@ import html
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify, make_response
 from twilio.twiml.messaging_response import MessagingResponse
 
 from redis import Redis
@@ -403,7 +403,107 @@ def whatsapp_webhook():
         return twiml("Perdón, tuve un problema técnico 🙏\nIntenta de nuevo en un momento.")
 
 # =========================
-# Reporte web
+# API JSON para Divi (NUEVO - cambio mínimo)
+# =========================
+def _cors_json(payload, status=200):
+    resp = make_response(jsonify(payload), status)
+    # Puedes cambiar "*" por "https://tuderecholaboralmexico.com" si quieres restringir
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    # anti-caché fuerte (para evitar "reportes viejos")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
+@app.route("/api/report", methods=["GET", "OPTIONS"])
+def api_report():
+    if request.method == "OPTIONS":
+        return _cors_json({"ok": True})
+
+    token = (request.args.get("token") or "").strip()
+    if not token:
+        return _cors_json({"ok": False, "error": "missing_token"}, 400)
+
+    if not GOOGLE_SHEET_NAME:
+        return _cors_json({"ok": False, "error": "missing_google_sheet_name"}, 500)
+
+    try:
+        sh = open_spreadsheet(GOOGLE_SHEET_NAME)
+        ws_leads = open_worksheet(sh, TAB_LEADS)
+
+        h = build_header_map(ws_leads)
+        row_num = find_row_by_value(ws_leads, "Token_Reporte", token, hmap=h)
+        if not row_num:
+            return _cors_json({"ok": False, "error": "token_not_found"}, 404)
+
+        lead = read_lead_row(ws_leads, row_num, h)
+
+        # Antigüedad (para el reporte web), si no viene ya calculada
+        try:
+            from datetime import date as _date
+            ini = None
+            fin = None
+
+            ini_str = (lead.get("Fecha_Inicio_Laboral") or "").strip()
+            fin_str = (lead.get("Fecha_Fin_Laboral") or "").strip()
+
+            if not ini_str:
+                y = int((lead.get("Inicio_Anio") or "0") or "0")
+                m = int((lead.get("Inicio_Mes") or "0") or "0")
+                d = int((lead.get("Inicio_Dia") or "0") or "0")
+                if y and m and d:
+                    ini_str = f"{y:04d}-{m:02d}-{d:02d}"
+                    lead["Fecha_Inicio_Laboral"] = ini_str
+
+            if not fin_str:
+                y = int((lead.get("Fin_Anio") or "0") or "0")
+                m = int((lead.get("Fin_Mes") or "0") or "0")
+                d = int((lead.get("Fin_Dia") or "0") or "0")
+                if y and m and d:
+                    fin_str = f"{y:04d}-{m:02d}-{d:02d}"
+                    lead["Fecha_Fin_Laboral"] = fin_str
+
+            if ini_str:
+                ini = _date.fromisoformat(ini_str)
+            if fin_str:
+                fin = _date.fromisoformat(fin_str)
+
+            if ini and fin:
+                years = max((fin - ini).days, 0) / 365.0
+                lead["Antiguedad"] = f"{years:.2f} años"
+        except Exception:
+            pass
+
+        # Solo devolvemos campos necesarios (más estable/seguro)
+        allow = [
+            "ID_Lead",
+            "Nombre", "Apellido",
+            "Tipo_Caso",
+            "Salario_Mensual",
+            "Fecha_Inicio_Laboral", "Fecha_Fin_Laboral",
+            "Antiguedad",
+            "Analisis_AI",
+            "Resultado_Calculo",
+            "Total_Estimado",
+            "Indemnizacion_90", "Indemnizacion_20",
+            "Prima_Antiguedad",
+            "Aguinaldo_Prop", "Vacaciones_Prop", "Prima_Vac_Prop",
+            "Vac_Dias_Base",
+            "Abogado_Asignado_Nombre",
+            "Link_WhatsApp",
+            "Token_Reporte",
+        ]
+
+        data = {k: (lead.get(k, "") if lead.get(k, "") is not None else "") for k in allow}
+        return _cors_json({"ok": True, "data": data}, 200)
+
+    except Exception as e:
+        app.logger.exception(f"[ERROR] api_report exception: {e}")
+        return _cors_json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+# =========================
+# Reporte web (legacy: Render) - lo dejo intacto
 # =========================
 @app.get("/reporte")
 def reporte():
