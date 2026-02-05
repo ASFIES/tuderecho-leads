@@ -23,7 +23,7 @@ TAB_SYS   = os.environ.get("TAB_SYS", "Config_Sistema").strip()
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN  = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
-TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "").strip()  # whatsapp:+....
+TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "").strip()
 
 def now_iso():
     return datetime.now(MX_TZ).strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -34,23 +34,17 @@ def _wa_addr(raw: str) -> str:
     Acepta:
       - "whatsapp:+521..." (ok)
       - "+521..."         -> "whatsapp:+521..."
-      - "521..."          -> "whatsapp:+521..."  ✅ (ajuste mínimo para evitar fallas)
+      - "521..."          -> "whatsapp:+521..."  (evita fallas comunes)
     """
     t = (raw or "").strip()
     if not t:
         return ""
-
-    # Si viene con prefijo whatsapp:, extraemos el número
     if t.startswith("whatsapp:"):
         num = t.split(":", 1)[1].strip()
     else:
         num = t
-
-    # Ajuste mínimo: si es numérico y NO trae "+", lo agregamos
-    # (WhatsApp/Twilio normalmente requiere E.164 con +)
     if num and num[0].isdigit() and not num.startswith("+"):
         num = "+" + num
-
     return "whatsapp:" + num
 
 def _get_twilio_client() -> Client:
@@ -65,13 +59,12 @@ def send_whatsapp_safe(to_number: str, body: str):
     try:
         if not TWILIO_WHATSAPP_NUMBER:
             return (False, "Falta TWILIO_WHATSAPP_NUMBER.")
-
         client = _get_twilio_client()
-
-        from_num = _wa_addr(TWILIO_WHATSAPP_NUMBER)  # 🔥 normaliza FROM
-        to_num = _wa_addr(to_number)                  # 🔥 normaliza TO
-
-        msg = client.messages.create(from_=from_num, to=to_num, body=body)
+        msg = client.messages.create(
+            from_=_wa_addr(TWILIO_WHATSAPP_NUMBER),
+            to=_wa_addr(to_number),
+            body=body
+        )
         return (True, f"SID={getattr(msg, 'sid', '')}")
     except TwilioRestException as e:
         code = getattr(e, "code", "")
@@ -119,11 +112,18 @@ def read_sys_config(ws_sys) -> dict:
             out[k] = v
     return out
 
+def _filter_to_existing_columns(data: dict, hmap: dict) -> dict:
+    """
+    Evita errores si intentas guardar columnas que aún no existen en Sheets.
+    (cambio mínimo, no toca utils)
+    """
+    if not isinstance(hmap, dict) or not hmap:
+        return data
+    return {k: v for k, v in data.items() if k in hmap}
+
 def pick_abogado(ws_abog, salario_mensual: float):
     """
-    - salario >= 50,000 => intenta A01 (si Activo)
-    - si no, activo con menor Leads_Asignados_Hoy
-    - si no hay activos, fallback A01
+    Mantiene tu lógica original: VIP a A01 si salario>=50k, si no por carga.
     """
     h = build_header_map(ws_abog)
     rows = with_backoff(ws_abog.get_all_values)
@@ -172,6 +172,7 @@ def years_of_service(ini: date, fin: date) -> float:
     return days / 365.0 if days else 0.0
 
 def vacation_days_by_years(y: int) -> int:
+    # Ley vigente (aprox) 2023+: 12,14,16,18,20...
     if y <= 0:
         return 0
     if y == 1: return 12
@@ -199,97 +200,141 @@ def _parse_date_parts(h, vals, prefix: str) -> date:
         raise ValueError(f"{prefix}: día inválido ({d})")
     return date(y, m, d)
 
-def calc_estimacion(
-    tipo_caso: str,
-    salario_mensual: float,
-    ini: date,
-    fin: date,
-    salario_min_diario: float = 0.0
-):
+def _safe_anniversary(base: date, year: int) -> date:
     """
-    Despido:
-      (SDI*90) + (SDI*20*Años) + (SD_top*12*Años) + proporcionales
-    Renuncia:
-      proporcionales + (prima antigüedad si >=15 años)
+    Devuelve aniversario (mismo mes/día) en 'year' manejando 29/02.
+    """
+    try:
+        return date(year, base.month, base.day)
+    except Exception:
+        # fallback 28 feb si es 29 feb
+        if base.month == 2 and base.day == 29:
+            return date(year, 2, 28)
+        # fallback general
+        return date(year, base.month, min(base.day, 28))
+
+def calc_estimacion(tipo_caso: str, salario_mensual: float, ini: date, fin: date, salario_min_diario: float):
+    """
+    Devuelve:
+      - detalle_txt (para web)
+      - total (float)
+      - breakdown (dict para guardar campos opcionales)
     """
     sd = salario_mensual / 30.0 if salario_mensual else 0.0
-    sdi = sd  # aproximación
+    sdi = sd  # aproximación SDI
 
     y = years_of_service(ini, fin)
     y_int = int(y) if y > 0 else 0
-
-    start_year = date(fin.year, 1, 1)
-    from_dt = max(start_year, ini)
-    days_in_year = max((fin - from_dt).days, 0)
-
-    aguinaldo_days = 15
-    prima_vac = 0.25
-
-    aguinaldo_prop = sd * aguinaldo_days * (days_in_year / 365.0) if sd else 0.0
-
     vac_days = vacation_days_by_years(max(y_int, 1) if y > 0 else 0)
-    vacaciones_prop = sd * vac_days * (days_in_year / 365.0) if sd else 0.0
-    prima_vac_prop = vacaciones_prop * prima_vac
 
+    # Aguinaldo proporcional: por año calendario (desde 1 enero o desde inicio si fue este año)
+    start_year = date(fin.year, 1, 1)
+    from_agui = max(start_year, ini)
+    days_agui = max((fin - from_agui).days, 0)
+    aguinaldo_days = 15
+    aguinaldo_prop = sd * aguinaldo_days * (days_agui / 365.0) if sd else 0.0
+
+    # Vacaciones proporcionales: desde último aniversario (más “realista” en la práctica)
+    ann_this = _safe_anniversary(ini, fin.year)
+    last_ann = ann_this if fin >= ann_this else _safe_anniversary(ini, fin.year - 1)
+    days_vac = max((fin - last_ann).days, 0)
+    vacaciones_prop = sd * vac_days * (days_vac / 365.0) if sd else 0.0
+    prima_vac_prop = vacaciones_prop * 0.25
+
+    # Prima de antigüedad topada a 2 SM diarios
     sd_top = sd
     if salario_min_diario and salario_min_diario > 0:
         sd_top = min(sd, 2.0 * salario_min_diario)
-
     prima_ant = sd_top * 12.0 * y if (sd_top and y > 0) else 0.0
 
+    breakdown = {
+        "SD": sd,
+        "SD_TOP": sd_top,
+        "ANIOS": y,
+        "VAC_DIAS": vac_days,
+        "DIAS_AGUINALDO_PROP": days_agui,
+        "DIAS_VAC_PROP": days_vac,
+        "AGUINALDO_PROP": aguinaldo_prop,
+        "VACACIONES_PROP": vacaciones_prop,
+        "PRIMA_VAC_PROP": prima_vac_prop,
+        "PRIMA_ANT": prima_ant,
+    }
+
     if str(tipo_caso).strip() == "1":
-        ind_3m = sdi * 90.0
+        ind_90 = sdi * 90.0
         ind_20 = sdi * 20.0 * y
+        total = ind_90 + ind_20 + prima_ant + aguinaldo_prop + vacaciones_prop + prima_vac_prop
 
-        total = ind_3m + ind_20 + prima_ant + aguinaldo_prop + vacaciones_prop + prima_vac_prop
+        breakdown.update({
+            "IND_90": ind_90,
+            "IND_20": ind_20,
+            "TOTAL": total
+        })
 
-        texto = (
-            "📌 *Estimación preliminar (informativa)*\n"
-            f"• Antigüedad estimada: {y:.2f} años\n"
-            f"• 3 meses (90 días): ${ind_3m:,.2f}\n"
-            f"• 20 días por año: ${ind_20:,.2f}\n"
-            f"• Prima de antigüedad (12 días/año): ${prima_ant:,.2f}\n"
-            f"• Aguinaldo proporcional: ${aguinaldo_prop:,.2f}\n"
-            f"• Vacaciones proporcionales: ${vacaciones_prop:,.2f}\n"
-            f"• Prima vacacional proporcional: ${prima_vac_prop:,.2f}\n"
-            f"✅ *Total estimado:* ${total:,.2f}\n\n"
-            "Nota: puede variar por salario integrado real, salarios caídos y otras prestaciones."
+        detalle_txt = (
+            "DESGLOSE DETALLADO (REFERENCIAL)\n"
+            f"- Salario mensual considerado: ${salario_mensual:,.2f}\n"
+            f"- Salario diario (SD aprox): ${sd:,.2f}\n"
+            f"- Antigüedad estimada: {y:.2f} años\n\n"
+            "INDEMNIZACIÓN (DESPIDO)\n"
+            f"- 3 meses (90 días): ${ind_90:,.2f}\n"
+            f"- 20 días por año: ${ind_20:,.2f}\n"
+            f"- Prima de antigüedad (12 días/año, topada): ${prima_ant:,.2f}\n\n"
+            "PRESTACIONES PROPORCIONALES\n"
+            f"- Aguinaldo proporcional (desde {from_agui}): ${aguinaldo_prop:,.2f}\n"
+            f"- Vacaciones proporcionales (desde {last_ann} / {vac_days} días/año): ${vacaciones_prop:,.2f}\n"
+            f"- Prima vacacional (25%): ${prima_vac_prop:,.2f}\n\n"
+            f"TOTAL ESTIMADO: ${total:,.2f}\n\n"
+            "Nota: el monto puede variar por salario integrado real, prestaciones adicionales, "
+            "salarios caídos, prima de antigüedad conforme topes vigentes y documentación del caso."
         )
-        return (texto, total)
+        return (detalle_txt, total, breakdown)
 
+    # Renuncia / finiquito
     total = aguinaldo_prop + vacaciones_prop + prima_vac_prop
     prima_ant_ren = 0.0
     if y >= 15:
         prima_ant_ren = prima_ant
         total += prima_ant_ren
 
-    texto = (
-        "📌 *Estimación preliminar (informativa)*\n"
-        "En renuncia normalmente procede *finiquito*: aguinaldo proporcional, "
-        "vacaciones proporcionales/no gozadas y prima vacacional (más pagos pendientes si existieran).\n\n"
-        f"• Aguinaldo proporcional (aprox): ${aguinaldo_prop:,.2f}\n"
-        f"• Vacaciones proporcionales (aprox): ${vacaciones_prop:,.2f}\n"
-        f"• Prima vacacional (aprox): ${prima_vac_prop:,.2f}\n"
-        + (f"• Prima de antigüedad (≥15 años): ${prima_ant_ren:,.2f}\n" if prima_ant_ren else "")
-        + f"✅ *Total estimado:* ${total:,.2f}\n\n"
-        "Nota: puede variar según recibos, prestaciones reales y pagos pendientes."
+    breakdown.update({
+        "IND_90": 0.0,
+        "IND_20": 0.0,
+        "PRIMA_ANT_REN": prima_ant_ren,
+        "TOTAL": total
+    })
+
+    detalle_txt = (
+        "DESGLOSE DETALLADO (REFERENCIAL)\n"
+        f"- Salario mensual considerado: ${salario_mensual:,.2f}\n"
+        f"- Salario diario (SD aprox): ${sd:,.2f}\n"
+        f"- Antigüedad estimada: {y:.2f} años\n\n"
+        "FINIQUITO (RENUNCIA)\n"
+        f"- Aguinaldo proporcional (desde {from_agui}): ${aguinaldo_prop:,.2f}\n"
+        f"- Vacaciones proporcionales (desde {last_ann} / {vac_days} días/año): ${vacaciones_prop:,.2f}\n"
+        f"- Prima vacacional (25%): ${prima_vac_prop:,.2f}\n"
+        + (f"- Prima de antigüedad (≥15 años): ${prima_ant_ren:,.2f}\n" if prima_ant_ren else "")
+        + f"\nTOTAL ESTIMADO: ${total:,.2f}\n\n"
+        "Nota: puede variar según recibos, prestaciones reales, pagos pendientes y documentación."
     )
-    return (texto, total)
+    return (detalle_txt, total, breakdown)
 
 def build_resumen_largo(tipo_caso: str, nombre: str) -> str:
     if str(tipo_caso).strip() == "1":
         return (
-            f"{nombre}, lamento mucho lo que estás viviendo. Gracias por contarnos tu situación.\n\n"
-            "📌 *Lo más importante:* tus derechos laborales importan y vamos a acompañarte paso a paso.\n\n"
-            "En términos generales, ante un despido el patrón debe acreditar causa legal y cumplir formalidades. "
-            "Cuando no se acredita, normalmente se reclama indemnización o reinstalación, además de prestaciones pendientes.\n\n"
-            "⚖️ Esta orientación es *informativa* (no es asesoría legal). Una abogada revisará tu caso con detalle."
+            f"{nombre}, lamento mucho lo que estás viviendo.\n\n"
+            "En un despido, lo clave es revisar: (1) causa y forma del despido, (2) salario real/integrado, "
+            "(3) antigüedad y (4) prestaciones efectivamente pagadas.\n\n"
+            "Con tu información generamos una estimación preliminar para darte una idea clara. "
+            "Una abogada revisará tu caso y te indicará el mejor camino (negociación, demanda, reinstalación o indemnización).\n\n"
+            "⚖️ Orientación informativa (no constituye asesoría legal)."
         )
     return (
         f"{nombre}, gracias por confiar en nosotros.\n\n"
-        "📌 *Lo más importante:* aunque sea renuncia, conservas derechos. Usualmente corresponde finiquito "
-        "(proporcionales de aguinaldo, vacaciones y prima vacacional, además de pagos pendientes si existieran).\n\n"
-        "⚖️ Esta orientación es *informativa* (no es asesoría legal). Una abogada revisará tu caso."
+        "En renuncia voluntaria normalmente corresponde finiquito: aguinaldo proporcional, vacaciones proporcionales/no gozadas "
+        "y prima vacacional, además de pagos pendientes (si existieran).\n\n"
+        "Una abogada revisará recibos y condiciones reales para confirmar el monto y el siguiente paso.\n\n"
+        "⚖️ Orientación informativa (no constituye asesoría legal)."
     )
 
 def process_lead(lead_id: str):
@@ -312,12 +357,11 @@ def process_lead(lead_id: str):
         c = col_idx(h, name)
         return (vals[c-1] if c and c-1 < len(vals) else "").strip()
 
-    # RUNNING
-    update_row_cells(ws_leads, row, {
+    update_row_cells(ws_leads, row, _filter_to_existing_columns({
         "Procesar_AI_Status": "RUNNING",
         "Ultimo_Error": "",
         "Ultima_Actualizacion": now_iso(),
-    }, hmap=h)
+    }, h), hmap=h)
 
     syscfg = read_sys_config(ws_sys)
 
@@ -336,13 +380,13 @@ def process_lead(lead_id: str):
 
         resumen_largo = build_resumen_largo(tipo_caso, nombre)
 
-        # Resumen corto WhatsApp según Config_Sistema.MAX_PALABRAS_RESUMEN
         max_words = safe_int(syscfg.get("MAX_PALABRAS_RESUMEN") or "50")
         resumen_corto = clip_words(resumen_largo, max_words if max_words > 0 else 50)
 
-        salario_min_diario = safe_float(syscfg.get("SALARIO_MIN_DIARIO") or "0")
+        # Default mínimo si no está en Config_Sistema
+        salario_min_diario = safe_float(syscfg.get("SALARIO_MIN_DIARIO") or "248.93")
 
-        estimacion_txt, total_estimado = calc_estimacion(
+        detalle_web, total_estimado, b = calc_estimacion(
             tipo_caso=tipo_caso,
             salario_mensual=salario,
             ini=ini,
@@ -362,7 +406,7 @@ def process_lead(lead_id: str):
             if tnorm:
                 link_abog = f"https://wa.me/{tnorm.replace('+','')}"
 
-        # ✅ WhatsApp: SOLO TOTAL (detalle queda en web)
+        # WhatsApp: SOLO TOTAL + texto humano + link web
         mensaje_final = (
             f"✅ {nombre}, ya tengo tu *estimación preliminar*.\n\n"
             f"💰 *Total estimado:* ${total_estimado:,.2f}\n\n"
@@ -373,10 +417,10 @@ def process_lead(lead_id: str):
             mensaje_final += f"\n📄 *Detalle en web:* {link_reporte}\n"
         mensaje_final += "\nSi deseas opciones, escribe *menu*."
 
-        # 1) Guarda SIEMPRE el cálculo detallado en Sheets (para web)
-        update_row_cells(ws_leads, row, {
-            "Resultado_Calculo": estimacion_txt,        # detalle
-            "Analisis_AI": resumen_largo,               # largo para el /reporte
+        # Guardado en Sheets (web detallado)
+        payload = {
+            "Resultado_Calculo": detalle_web,          # ✅ detalle para web
+            "Analisis_AI": resumen_largo,              # ✅ texto más completo
             "Abogado_Asignado_ID": abogado_id,
             "Abogado_Asignado_Nombre": abogado_nombre,
             "Token_Reporte": token,
@@ -384,36 +428,43 @@ def process_lead(lead_id: str):
             "Link_WhatsApp": link_abog,
             "Ultimo_Error": "",
             "Ultima_Actualizacion": now_iso(),
-            # ✅ clave para que tu web muestre el total sin “parsear”
             "Total_Estimado": f"{total_estimado:.2f}",
-        }, hmap=h)
 
-        # 2) Envía SOLO el resultado (sin menú automático)
+            # Campos opcionales (solo si existen en BD_Leads)
+            "Indemnizacion_90": f"{b.get('IND_90', 0.0):.2f}",
+            "Indemnizacion_20": f"{b.get('IND_20', 0.0):.2f}",
+            "Prima_Antiguedad": f"{b.get('PRIMA_ANT', 0.0):.2f}",
+            "Aguinaldo_Prop": f"{b.get('AGUINALDO_PROP', 0.0):.2f}",
+            "Vacaciones_Prop": f"{b.get('VACACIONES_PROP', 0.0):.2f}",
+            "Prima_Vac_Prop": f"{b.get('PRIMA_VAC_PROP', 0.0):.2f}",
+            "Vac_Dias_Base": str(b.get("VAC_DIAS", "")),
+        }
+
+        update_row_cells(ws_leads, row, _filter_to_existing_columns(payload, h), hmap=h)
+
         ok1, det1 = send_whatsapp_safe(telefono, mensaje_final)
 
         if ok1:
-            update_row_cells(ws_leads, row, {
+            update_row_cells(ws_leads, row, _filter_to_existing_columns({
                 "Procesar_AI_Status": "DONE",
                 "ESTATUS": "CLIENTE_MENU",
                 "Ultimo_Error": "",
                 "Ultima_Actualizacion": now_iso(),
-            }, hmap=h)
+            }, h), hmap=h)
         else:
-            # si falla envío, no lo pases a menú automático
-            err = f"send1={ok1}({det1})"
-            update_row_cells(ws_leads, row, {
+            update_row_cells(ws_leads, row, _filter_to_existing_columns({
                 "Procesar_AI_Status": "DONE_SEND_ERROR",
                 "ESTATUS": "EN_PROCESO",
-                "Ultimo_Error": err[:450],
+                "Ultimo_Error": f"send1={ok1}({det1})"[:450],
                 "Ultima_Actualizacion": now_iso(),
-            }, hmap=h)
+            }, h), hmap=h)
 
         return {"ok": True, "lead_id": lead_id, "send1": ok1, "det1": det1}
 
     except Exception as e:
-        update_row_cells(ws_leads, row, {
+        update_row_cells(ws_leads, row, _filter_to_existing_columns({
             "Procesar_AI_Status": "FAILED",
             "Ultimo_Error": f"{type(e).__name__}: {e}",
             "Ultima_Actualizacion": now_iso(),
-        }, hmap=h)
+        }, h), hmap=h)
         raise
