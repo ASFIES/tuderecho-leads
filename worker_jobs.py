@@ -34,12 +34,24 @@ def _wa_addr(raw: str) -> str:
     Acepta:
       - "whatsapp:+521..." (ok)
       - "+521..."         -> "whatsapp:+521..."
-      - "521..."          -> "whatsapp:521..." (preferible que venga con +)
+      - "521..."          -> "whatsapp:+521..."  ✅ (ajuste mínimo para evitar fallas)
     """
     t = (raw or "").strip()
     if not t:
         return ""
-    return t if t.startswith("whatsapp:") else "whatsapp:" + t
+
+    # Si viene con prefijo whatsapp:, extraemos el número
+    if t.startswith("whatsapp:"):
+        num = t.split(":", 1)[1].strip()
+    else:
+        num = t
+
+    # Ajuste mínimo: si es numérico y NO trae "+", lo agregamos
+    # (WhatsApp/Twilio normalmente requiere E.164 con +)
+    if num and num[0].isdigit() and not num.startswith("+"):
+        num = "+" + num
+
+    return "whatsapp:" + num
 
 def _get_twilio_client() -> Client:
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
@@ -62,7 +74,6 @@ def send_whatsapp_safe(to_number: str, body: str):
         msg = client.messages.create(from_=from_num, to=to_num, body=body)
         return (True, f"SID={getattr(msg, 'sid', '')}")
     except TwilioRestException as e:
-        # incluye code si existe
         code = getattr(e, "code", "")
         return (False, f"TwilioRestException {code}: {str(e)}")
     except Exception as e:
@@ -196,12 +207,10 @@ def calc_estimacion(
     salario_min_diario: float = 0.0
 ):
     """
-    Implementa tu estructura:
     Despido:
       (SDI*90) + (SDI*20*Años) + (SD_top*12*Años) + proporcionales
     Renuncia:
       proporcionales + (prima antigüedad si >=15 años)
-    NOTA: SDI aquí se aproxima con SD (no tenemos integración real).
     """
     sd = salario_mensual / 30.0 if salario_mensual else 0.0
     sdi = sd  # aproximación
@@ -209,7 +218,6 @@ def calc_estimacion(
     y = years_of_service(ini, fin)
     y_int = int(y) if y > 0 else 0
 
-    # Proporcionales del año de terminación (aprox)
     start_year = date(fin.year, 1, 1)
     from_dt = max(start_year, ini)
     days_in_year = max((fin - from_dt).days, 0)
@@ -223,7 +231,6 @@ def calc_estimacion(
     vacaciones_prop = sd * vac_days * (days_in_year / 365.0) if sd else 0.0
     prima_vac_prop = vacaciones_prop * prima_vac
 
-    # Prima antigüedad (topable a 2x salario mínimo diario si nos dan el mínimo)
     sd_top = sd
     if salario_min_diario and salario_min_diario > 0:
         sd_top = min(sd, 2.0 * salario_min_diario)
@@ -250,7 +257,6 @@ def calc_estimacion(
         )
         return (texto, total)
 
-    # Renuncia
     total = aguinaldo_prop + vacaciones_prop + prima_vac_prop
     prima_ant_ren = 0.0
     if y >= 15:
@@ -356,29 +362,20 @@ def process_lead(lead_id: str):
             if tnorm:
                 link_abog = f"https://wa.me/{tnorm.replace('+','')}"
 
-        # Mensaje final (WhatsApp)
+        # ✅ WhatsApp: SOLO TOTAL (detalle queda en web)
         mensaje_final = (
-            f"✅ {nombre}, ya tengo una *estimación preliminar*.\n\n"
+            f"✅ {nombre}, ya tengo tu *estimación preliminar*.\n\n"
+            f"💰 *Total estimado:* ${total_estimado:,.2f}\n\n"
             f"{resumen_corto}\n\n"
-            f"{estimacion_txt}\n\n"
-            f"👩‍⚖️ Abogada asignada: *{abogado_nombre}*.\n"
+            f"👩‍⚖️ La abogada asignada es *{abogado_nombre}* y se comunicará contigo muy pronto.\n"
         )
         if link_reporte:
-            mensaje_final += f"\n📄 Reporte en web: {link_reporte}\n"
-        mensaje_final += "\nSi quieres, escribe *menu* para ver opciones."
+            mensaje_final += f"\n📄 *Detalle en web:* {link_reporte}\n"
+        mensaje_final += "\nSi deseas opciones, escribe *menu*."
 
-        menu = (
-            f"Hola {nombre} 👋 Estoy contigo.\n\n"
-            "¿Qué opción deseas?\n"
-            "1️⃣ Próximas fechas agendadas\n"
-            "2️⃣ Resumen de mi caso hasta hoy\n"
-            "3️⃣ Contactar a mi abogada\n\n"
-            "Tip: también puedes escribir *menu* en cualquier momento."
-        )
-
-        # 1) Guarda SIEMPRE el cálculo en Sheets
+        # 1) Guarda SIEMPRE el cálculo detallado en Sheets (para web)
         update_row_cells(ws_leads, row, {
-            "Resultado_Calculo": estimacion_txt,
+            "Resultado_Calculo": estimacion_txt,        # detalle
             "Analisis_AI": resumen_largo,               # largo para el /reporte
             "Abogado_Asignado_ID": abogado_id,
             "Abogado_Asignado_Nombre": abogado_nombre,
@@ -387,15 +384,14 @@ def process_lead(lead_id: str):
             "Link_WhatsApp": link_abog,
             "Ultimo_Error": "",
             "Ultima_Actualizacion": now_iso(),
-            # opcional si creas esta columna:
+            # ✅ clave para que tu web muestre el total sin “parsear”
             "Total_Estimado": f"{total_estimado:.2f}",
         }, hmap=h)
 
-        # 2) Envía WhatsApp (y si falla, no truena todo)
+        # 2) Envía SOLO el resultado (sin menú automático)
         ok1, det1 = send_whatsapp_safe(telefono, mensaje_final)
-        ok2, det2 = send_whatsapp_safe(telefono, menu) if ok1 else (False, "skip_menu_por_error_previo")
 
-        if ok1 and ok2:
+        if ok1:
             update_row_cells(ws_leads, row, {
                 "Procesar_AI_Status": "DONE",
                 "ESTATUS": "CLIENTE_MENU",
@@ -403,8 +399,8 @@ def process_lead(lead_id: str):
                 "Ultima_Actualizacion": now_iso(),
             }, hmap=h)
         else:
-            # Importante: si NO se pudo enviar, no lo pases a CLIENTE_MENU para no “romper” el chat
-            err = f"send1={ok1}({det1}) send2={ok2}({det2})"
+            # si falla envío, no lo pases a menú automático
+            err = f"send1={ok1}({det1})"
             update_row_cells(ws_leads, row, {
                 "Procesar_AI_Status": "DONE_SEND_ERROR",
                 "ESTATUS": "EN_PROCESO",
@@ -412,7 +408,7 @@ def process_lead(lead_id: str):
                 "Ultima_Actualizacion": now_iso(),
             }, hmap=h)
 
-        return {"ok": True, "lead_id": lead_id, "send1": ok1, "send2": ok2}
+        return {"ok": True, "lead_id": lead_id, "send1": ok1, "det1": det1}
 
     except Exception as e:
         update_row_cells(ws_leads, row, {
