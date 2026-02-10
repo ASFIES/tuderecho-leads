@@ -428,7 +428,7 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
         for t in temas[:3]:
             title = t.get("Titulo_Visible") or "Punto legal relevante"
             bullets.append(f"• {title}")
-        bullets_txt = "\n".join(bullets) if bullets else "• Revisión de causa/forma del evento y prestaciones.\n• Validación de salario real/integrado.\n• Confirmación de pagos pendientes y documentos, haz una explicación  no muy tecnica de las situacion  y de cada punto y el para que  debe ser de forma empatica con sentido legal pero con leguaje sencillo en 150 palabras."
+        bullets_txt = "\n".join(bullets) if bullets else "• Revisión de causa/forma del evento y prestaciones.\n• Validación de salario real/integrado.\n• Confirmación de pagos pendientes y documentos."
 
         return (
             f"{nombre}, lamento la situación y gracias por confiar en nosotros.\n\n"
@@ -469,31 +469,33 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
             {
                 "role": "system",
                 "content": (
-                    "Eres un asistente de recepción legal (derecho laboral México) para un despacho. "
-                    "Redactas un análisis consultivo, empático, sensible y claro. "
-                    "NO prometes resultados, NO das asesoría definitiva, y siempre incluyes un aviso de que es orientación informativa. "
-                    "Formato tipo McKinsey: títulos en mayúsculas, bullets, pasos accionables. "
-                    "No menciones 'OpenAI' ni 'GPT'."
+                    "Eres un asistente legal experto y amigable en derecho laboral mexicano. "
+                    "Tu objetivo es explicar la situación al usuario de forma clara, sencilla y empática, sin usar tecnicismos complejos. "
+                    "Debes guiarlo paso a paso en lo que debe hacer, explicando el 'por qué' de cada acción de manera práctica. "
+                    "Utiliza la información de la base de conocimiento proporcionada para dar consejos precisos y fundamentados. "
+                    "Habla siempre en primera persona del plural ('te recomendamos', 'sugerimos') o como un aliado experto."
                 )
             },
             {
                 "role": "user",
                 "content": (
-                    f"Datos del caso:\n"
+                    f"Analiza el siguiente caso laboral y genera una respuesta personalizada para {nombre}.\n\n"
+                    f"**Datos del Usuario:**\n"
                     f"- Nombre: {nombre}\n"
-                    f"- Tipo: {tipo_h}\n"
+                    f"- Tipo de Caso: {tipo_h}\n"
                     f"- Descripción: {desc}\n"
-                    f"- Salario mensual reportado: {salario_mensual}\n"
-                    f"- Periodo: {ini.isoformat()} a {fin.isoformat()}\n\n"
-                    f"Base de conocimiento (úsala para orientar):\n{contexto if contexto else '(Sin temas seleccionados)'}\n\n"
-                    "Entrega un texto con estas secciones:\n"
-                    "1) RESUMEN EJECUTIVO (2-4 bullets)\n"
-                    "2) LECTURA INICIAL DEL CASO (2-4 líneas, empático)\n"
-                    "3) DERECHOS / PRESTACIONES QUE SUELE HABER EN JUEGO (4-7 bullets)\n"
-                    "4) DOCUMENTOS CLAVE A REUNIR (5-8 bullets)\n"
-                    "5) ALERTAS / RIESGOS A CUIDAR (3-6 bullets)\n"
-                    "6) PRÓXIMOS PASOS RECOMENDADOS (1-5)\n"
-                    "Cierra con una frase humana y el aviso: 'Orientación informativa; no constituye asesoría legal.'"
+                    f"- Salario Mensual: ${salario_mensual:,.2f}\n"
+                    f"- Antigüedad: {ini.isoformat()} a {fin.isoformat()}\n\n"
+                    f"**Información Legal Relevante (Base de Conocimiento):**\n"
+                    f"{contexto if contexto else '(No se encontró información específica en la base de conocimiento, usa tu conocimiento general de la LFT)'}\n\n"
+                    "**Instrucciones para la Respuesta:**\n"
+                    "1.  **Empatía Inicial**: Empieza reconociendo su situación con un tono humano y comprensivo.\n"
+                    "2.  **Explicación del Caso**: Explica brevemente qué derechos generales aplican para un {tipo_h} con su antigüedad y salario. Usa lenguaje sencillo (evita jerga como 'laudo', 'litis' a menos que lo expliques).\n"
+                    "3.  **Guía Paso a Paso (Plan de Acción)**: Detalla una lista numerada de acciones concretas que debe realizar el usuario (ej. documentación a reunir, revisar contrato, no firmar hojas en blanco, etc.). Para cada paso, explica brevemente **por qué** es importante.\n"
+                    "4.  **Uso de Conocimiento**: Si hay temas en la 'Información Legal Relevante', incorpóralos naturalmente en la explicación.\n"
+                    "5.  **Personalización**: Menciona alguno de sus datos (ej. 'Al tener X años de antigüedad...', 'Considerando tu salario...') para que sienta que la respuesta es única para él.\n"
+                    "6.  **Cierre**: Termina con una frase de apoyo e invita a seguir el proceso.\n"
+                    "7.  **Sello Legal**: Incluye al final, separado, la leyenda: 'Orientación informativa; no constituye asesoría legal definitiva.'\n"
                 )
             }
         ]
@@ -501,8 +503,8 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.35,
-            max_tokens=650
+            temperature=0.4,
+            max_tokens=850
         )
         txt = (resp.choices[0].message.content or "").strip()
         return txt if txt else fallback()
@@ -650,7 +652,7 @@ def process_lead(lead_id: str):
             f"✅ {nombre}, ya tengo tu *estimación preliminar*.\n\n"
             f"💰 *Total estimado:* ${total_estimado:,.2f}\n\n"
             f"{resumen_wa}\n\n"
-            f"👩‍⚖️ Tu abogada asignada es *{abogado_nombre}* y se comunicará contigo muy pronto.\n"
+            f"👩⚖️ Tu abogada asignada es *{abogado_nombre}* y se comunicará contigo muy pronto.\n"
         )
         if link_reporte:
             mensaje_final += f"\n📄 Ver desglose en web: {link_reporte}\n"
