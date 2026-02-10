@@ -101,6 +101,13 @@ def _clip_chars(s: str, max_chars: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= max_chars else s[:max_chars].rstrip() + "…"
 
+# ✅ NUEVO: recorte por palabras (control de ~150 palabras)
+def _clip_words(text: str, max_words: int) -> str:
+    words = (text or "").strip().split()
+    if len(words) <= max_words:
+        return (text or "").strip()
+    return " ".join(words[:max_words]).rstrip() + "…"
+
 def read_sys_config(ws_sys) -> dict:
     values = get_all_values_safe(ws_sys)
     if not values or len(values) < 2:
@@ -131,22 +138,18 @@ def set_sys_value(ws_sys, key: str, value: str):
         values = get_all_values_safe(ws_sys)
 
     hdr = values[0]
-    # si header no trae Clave/Valor, no rompemos
     if "Clave" not in hdr or "Valor" not in hdr:
         return
 
-    # buscar fila por Clave
     for i in range(1, len(values)):
         row = values[i]
         d = row_to_dict(hdr, row)
         if (d.get("Clave") or "").strip() == key:
-            # actualizar Valor
             hmap = build_header_map(ws_sys)
-            row_num = i + 1  # sheet is 1-indexed
+            row_num = i + 1
             update_row_cells(ws_sys, row_num, {"Valor": str(value)}, hmap=hmap)
             return
 
-    # si no existe, append
     with_backoff(ws_sys.append_row, [key, str(value)], value_input_option="RAW")
 
 def list_active_abogados(ws_abog):
@@ -179,30 +182,25 @@ def list_active_abogados(ws_abog):
 def pick_abogado_secuencial(ws_abog, ws_sys, salario_mensual: float, syscfg: dict):
     """
     ✅ Regla:
-    - salario >= 50,000 => A01 (si está activo; si no, igualmente A01 si existe; si no, fallback primer activo)
+    - salario >= 50,000 => A01 (si está activo; si no, fallback primer activo)
     - si no, round-robin entre activos usando Config_Sistema.Clave = ABOGADO_ULTIMO_ID
     """
     activos = list_active_abogados(ws_abog)
     if not activos:
         return ("A01", "Abogada asignada", "")
 
-    # helper: obtener por id
     def by_id(aid: str):
         for x in activos:
             if x[0] == aid:
                 return x
         return None
 
-    # VIP
     if salario_mensual >= 50000:
         a01 = by_id("A01")
         if a01:
-            # nota: NO movemos el puntero de rotación por VIP (opcional). Aquí lo dejo SIN mover.
             return a01
-        # si no está activo A01 pero existe otro activo, se asigna el primero
         return activos[0]
 
-    # Round-robin (incluye A01 si está activo)
     last_id = (syscfg.get("ABOGADO_ULTIMO_ID") or "").strip()
     ids = [a[0] for a in activos]
 
@@ -212,7 +210,6 @@ def pick_abogado_secuencial(ws_abog, ws_sys, salario_mensual: float, syscfg: dic
     else:
         nxt = activos[0]
 
-    # guardar puntero
     try:
         set_sys_value(ws_sys, "ABOGADO_ULTIMO_ID", nxt[0])
     except Exception:
@@ -225,7 +222,6 @@ def years_of_service(ini: date, fin: date) -> float:
     return days / 365.0 if days else 0.0
 
 def vacation_days_by_years(y: int) -> int:
-    # Reforma: 1=12, 2=14, 3=16, 4=18, 5=20; luego +2 cada 5 años.
     if y <= 0:
         return 0
     if y == 1: return 12
@@ -270,37 +266,31 @@ def calc_estimacion_detallada(tipo_caso: str, salario_mensual: float, ini: date,
     """
     ✅ Cambiado: YA NO calcula indemnización de 20 días.
     Devuelve:
-      - desglose_texto (para web / Sheets)
+      - desglose_texto
       - total_estimado (float)
-      - componentes (dict) para columnas:
-        Indemnizacion_90, Indemnizacion_20(=0), Prima_Antiguedad,
-        Aguinaldo_Prop, Vacaciones_Prop, Prima_Vac_Prop, Vac_Dias_Base
-    Nota: aproximación con SD (no SDI real).
+      - componentes (dict)
     """
     sd = salario_mensual / 30.0 if salario_mensual else 0.0
     y = years_of_service(ini, fin)
     y_int = int(y) if y > 0 else 0
 
-    # Aguinaldo: proporcional por calendario (desde 1-ene del año de terminación)
     start_year = date(fin.year, 1, 1)
     days_agu = max((fin - start_year).days + 1, 0)
     aguinaldo_prop = sd * 15 * (days_agu / 365.0) if sd else 0.0
 
-    # Vacaciones: proporcional por aniversario (desde el último aniversario)
     vac_from = _last_anniversary(ini, fin)
     days_vac_period = max((fin - vac_from).days + 1, 0)
     vac_days_base = vacation_days_by_years(max(y_int, 1) if y > 0 else 0)
     vacaciones_prop = sd * vac_days_base * (days_vac_period / 365.0) if sd else 0.0
     prima_vac_prop = vacaciones_prop * 0.25
 
-    # Prima de antigüedad (topable 2x mínimo si existe)
     sd_top = sd
     if salario_min_diario and salario_min_diario > 0:
         sd_top = min(sd, 2.0 * salario_min_diario)
     prima_ant = sd_top * 12.0 * y if (sd_top and y > 0) else 0.0
 
     ind_90 = 0.0
-    ind_20 = 0.0  # ✅ siempre 0 (compatibilidad)
+    ind_20 = 0.0  # ✅ siempre 0
 
     if str(tipo_caso).strip() == "1":  # Despido
         ind_90 = sd * 90.0
@@ -344,7 +334,7 @@ def calc_estimacion_detallada(tipo_caso: str, salario_mensual: float, ini: date,
 
     componentes = {
         "Indemnizacion_90": ind_90,
-        "Indemnizacion_20": ind_20,  # ✅ 0
+        "Indemnizacion_20": ind_20,
         "Prima_Antiguedad": prima_ant,
         "Aguinaldo_Prop": aguinaldo_prop,
         "Vacaciones_Prop": vacaciones_prop,
@@ -354,16 +344,11 @@ def calc_estimacion_detallada(tipo_caso: str, salario_mensual: float, ini: date,
     return desglose, total, componentes
 
 def build_resumen_whatsapp(tipo_caso: str, nombre: str) -> str:
-    # WhatsApp: corto y humano
     if str(tipo_caso).strip() == "1":
         return f"{nombre}, lamento lo ocurrido. Este total es una referencia preliminar; lo afinamos con documentos."
     return f"{nombre}, gracias por contarnos tu caso. Este total es una referencia preliminar; lo afinamos con documentos."
 
 def load_conocimiento(ws_con):
-    """
-    Regresa lista de dicts con columnas:
-    ID_Tema, Titulo_Visible, Contenido_Legal, Palabras_Clave, Fuente
-    """
     values = get_all_values_safe(ws_con)
     if not values or len(values) < 2:
         return []
@@ -381,13 +366,9 @@ def load_conocimiento(ws_con):
     return out
 
 def select_conocimiento(con_rows, descripcion: str, tipo_caso: str, k=3):
-    """
-    Selecciona hasta k temas por coincidencia simple de palabras clave.
-    """
     desc_n = _normalize_text(descripcion)
     tokens = set([t for t in desc_n.split() if len(t) >= 4])
 
-    # boost por tipo
     if str(tipo_caso).strip() == "1":
         tokens |= {"despido", "indemnizacion", "indemnización", "finiquito", "rescision", "rescisión"}
     elif str(tipo_caso).strip() == "2":
@@ -399,10 +380,8 @@ def select_conocimiento(con_rows, descripcion: str, tipo_caso: str, k=3):
         key_list = [x.strip() for x in re.split(r"[;,]", keys) if x.strip()]
         score = 0
         for kw in key_list:
-            # match por palabra o frase
             if kw and (kw in desc_n or kw in tokens):
                 score += 2
-        # también revisa el título
         title = _normalize_text(row.get("Titulo_Visible", ""))
         for t in tokens:
             if t in title:
@@ -411,56 +390,52 @@ def select_conocimiento(con_rows, descripcion: str, tipo_caso: str, k=3):
             scored.append((score, row))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    pick = [r for _, r in scored[:k]]
-    return pick
+    return [r for _, r in scored[:k]]
 
+
+# --------------------
+# ✅ NUEVO ANÁLISIS WEB (más humano + 150 palabras)
+# --------------------
 def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salario_mensual: float, ini: date, fin: date, temas: list):
     """
-    Genera análisis consultivo (web) usando OpenAI + Conocimiento_AI.
-    Fallback: plantilla sensible si no hay OpenAI.
+    - Empático + profesional
+    - Legal claro sin jerga pesada
+    - 130–170 palabras aprox (recorte seguro)
+    - Usa Conocimiento_AI si existe
+    - Leyenda final fija (la agregamos aquí)
     """
     tipo_h = "Despido" if str(tipo_caso).strip() == "1" else ("Renuncia" if str(tipo_caso).strip() == "2" else "Caso laboral")
     desc = (descripcion or "").strip()
+    antig = years_of_service(ini, fin)
+    antig_txt = f"{antig:.2f} años" if antig > 0 else "—"
 
-    # ---- fallback (si no hay openai) ----
     def fallback():
-        bullets = []
-        for t in temas[:3]:
-            title = t.get("Titulo_Visible") or "Punto legal relevante"
-            bullets.append(f"• {title}")
-        bullets_txt = "\n".join(bullets) if bullets else "• Revisión de causa/forma del evento y prestaciones.\n• Validación de salario real/integrado.\n• Confirmación de pagos pendientes y documentos."
-
-        return (
-            f"{nombre}, lamento la situación y gracias por confiar en nosotros.\n\n"
-            "ANÁLISIS CONSULTIVO (REFERENCIAL)\n"
-            f"Tipo de caso: {tipo_h}\n"
-            f"Lo que nos compartiste: {desc if desc else '—'}\n\n"
-            "PUNTOS CLAVE A REVISAR\n"
-            f"{bullets_txt}\n\n"
-            "DOCUMENTOS QUE AYUDAN\n"
-            "• Recibos de nómina / transferencias\n"
-            "• Contrato o condiciones (si existen)\n"
-            "• Alta/baja IMSS, semanas cotizadas\n"
-            "• Mensajes o evidencia del motivo (si aplica)\n\n"
-            "PRÓXIMOS PASOS RECOMENDADOS\n"
-            "1) Reunir documentos y confirmar salario integrado.\n"
-            "2) Identificar prestaciones pendientes y pagos realizados.\n"
-            "3) Definir estrategia (negociación/demanda) según evidencia.\n\n"
-            "⚖️ Orientación informativa; no constituye asesoría legal."
+        txt = (
+            f"{nombre}, gracias por contarnos tu situación. Con lo que compartiste, parece un caso de *{tipo_h}* "
+            f"con una antigüedad aproximada de {antig_txt}. Este análisis es preliminar: el monto final puede ajustarse "
+            "al confirmar salario real (o integrado), pagos previos y la documentación disponible.\n\n"
+            "Para avanzar con seguridad te recomendamos:\n"
+            "• Reúne recibos de nómina/transferencias, contrato (si existe) y cualquier mensaje relacionado.\n"
+            "• Evita firmar renuncias o documentos en blanco sin revisión.\n"
+            "• Identifica si hubo pago de finiquito y qué prestaciones están pendientes (aguinaldo, vacaciones, prima vacacional).\n\n"
+            "Con esa base, definimos la mejor ruta: negociación o acción legal, según evidencia."
         )
+        txt = _clip_words(txt, 165)
+        return txt + "\n\nOrientación informativa; no constituye asesoría legal definitiva."
 
     if not (OPENAI_API_KEY and OpenAI):
         return fallback()
 
-    # ---- construir contexto con Conocimiento_AI ----
-    temas_txt = []
-    for t in temas[:3]:
-        temas_txt.append(
-            f"- {t.get('Titulo_Visible','Tema')}\n"
-            f"  Contenido: {_clip_chars(t.get('Contenido_Legal',''), 900)}\n"
-            f"  Fuente: {_clip_chars(t.get('Fuente',''), 180)}"
-        )
-    contexto = "\n".join(temas_txt).strip()
+    # Contexto breve desde Conocimiento_AI (sin saturar)
+    contexto_items = []
+    for t in (temas or [])[:3]:
+        titulo = (t.get("Titulo_Visible") or "Punto legal relevante").strip()
+        contenido = _clip_chars((t.get("Contenido_Legal") or "").strip(), 380)
+        if contenido:
+            contexto_items.append(f"- {titulo}: {contenido}")
+        else:
+            contexto_items.append(f"- {titulo}")
+    contexto = "\n".join(contexto_items).strip() or "(Sin entradas específicas; usa criterios generales de la LFT.)"
 
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
@@ -469,33 +444,30 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
             {
                 "role": "system",
                 "content": (
-                    "Eres un asistente legal experto y amigable en derecho laboral mexicano. "
-                    "Tu objetivo es explicar la situación al usuario de forma clara, sencilla y empática, sin usar tecnicismos complejos. "
-                    "Debes guiarlo paso a paso en lo que debe hacer, explicando el 'por qué' de cada acción de manera práctica. "
-                    "Utiliza la información de la base de conocimiento proporcionada para dar consejos precisos y fundamentados. "
-                    "Habla siempre en primera persona del plural ('te recomendamos', 'sugerimos') o como un aliado experto."
+                    "Eres un asistente legal en derecho laboral mexicano. "
+                    "Escribe con tono humano, cálido y profesional. "
+                    "Explica en lenguaje sencillo, sin tecnicismos pesados. "
+                    "No uses Markdown (no **negritas**). "
+                    "Texto final de 130 a 170 palabras. "
+                    "Puedes usar hasta 3 viñetas con '•'. "
+                    "NO incluyas la leyenda final; el sistema la añadirá."
                 )
             },
             {
                 "role": "user",
                 "content": (
-                    f"Analiza el siguiente caso laboral y genera una respuesta personalizada para {nombre}.\n\n"
-                    f"**Datos del Usuario:**\n"
-                    f"- Nombre: {nombre}\n"
-                    f"- Tipo de Caso: {tipo_h}\n"
-                    f"- Descripción: {desc}\n"
-                    f"- Salario Mensual: ${salario_mensual:,.2f}\n"
-                    f"- Antigüedad: {ini.isoformat()} a {fin.isoformat()}\n\n"
-                    f"**Información Legal Relevante (Base de Conocimiento):**\n"
-                    f"{contexto if contexto else '(No se encontró información específica en la base de conocimiento, usa tu conocimiento general de la LFT)'}\n\n"
-                    "**Instrucciones para la Respuesta:**\n"
-                    "1.  **Empatía Inicial**: Empieza reconociendo su situación con un tono humano y comprensivo.\n"
-                    "2.  **Explicación del Caso**: Explica brevemente qué derechos generales aplican para un {tipo_h} con su antigüedad y salario. Usa lenguaje sencillo (evita jerga como 'laudo', 'litis' a menos que lo expliques).\n"
-                    "3.  **Guía Paso a Paso (Plan de Acción)**: Detalla una lista numerada de acciones concretas que debe realizar el usuario (ej. documentación a reunir, revisar contrato, no firmar hojas en blanco, etc.). Para cada paso, explica brevemente **por qué** es importante.\n"
-                    "4.  **Uso de Conocimiento**: Si hay temas en la 'Información Legal Relevante', incorpóralos naturalmente en la explicación.\n"
-                    "5.  **Personalización**: Menciona alguno de sus datos (ej. 'Al tener X años de antigüedad...', 'Considerando tu salario...') para que sienta que la respuesta es única para él.\n"
-                    "6.  **Cierre**: Termina con una frase de apoyo e invita a seguir el proceso.\n"
-                    "7.  **Sello Legal**: Incluye al final, separado, la leyenda: 'Orientación informativa; no constituye asesoría legal definitiva.'\n"
+                    f"Genera un análisis consultivo personalizado para {nombre}.\n\n"
+                    f"Datos:\n"
+                    f"- Tipo: {tipo_h}\n"
+                    f"- Descripción: {desc if desc else '(sin descripción)'}\n"
+                    f"- Salario mensual: ${salario_mensual:,.2f}\n"
+                    f"- Periodo: {ini.isoformat()} a {fin.isoformat()} (antigüedad aprox. {antig_txt})\n\n"
+                    f"Base de conocimiento (usa lo relevante):\n{contexto}\n\n"
+                    "Requisitos:\n"
+                    "1) Abre con empatía.\n"
+                    "2) Explica qué suele revisarse en este tipo de caso y por qué el cálculo es preliminar.\n"
+                    "3) Da un mini plan de acción (2–3 puntos) con razones breves.\n"
+                    "4) Menciona al menos un dato del caso (salario/antigüedad/periodo) para personalizar."
                 )
             }
         ]
@@ -503,14 +475,26 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.4,
-            max_tokens=850
+            temperature=0.55,
+            max_tokens=420
         )
+
         txt = (resp.choices[0].message.content or "").strip()
-        return txt if txt else fallback()
+        if not txt:
+            return fallback()
+
+        # ✅ Por si GPT mete la leyenda (la quitamos y ponemos la nuestra)
+        txt = re.sub(r"(?is)\n*orientación informativa;.*$", "", txt).strip()
+
+        # ✅ Recorte seguro a ~150–165 palabras si se pasa
+        if len(txt.split()) > 175:
+            txt = _clip_words(txt, 165)
+
+        return txt + "\n\nOrientación informativa; no constituye asesoría legal definitiva."
 
     except Exception:
         return fallback()
+
 
 def upsert_abogados_admin(sh, lead_id: str, abogado_id: str):
     """
@@ -520,9 +504,8 @@ def upsert_abogados_admin(sh, lead_id: str, abogado_id: str):
     try:
         ws = open_worksheet(sh, TAB_ABOG_ADMIN)
     except Exception:
-        return  # si no existe, no rompe
+        return
 
-    # si ya existe, solo actualiza ID_Abogado / Estatus
     try:
         existing = find_row_by_value(ws, "ID_Lead", lead_id)
         if existing:
@@ -600,12 +583,10 @@ def process_lead(lead_id: str):
         if fin < ini:
             raise ValueError("Fecha fin es menor a fecha inicio.")
 
-        # ✅ abogado secuencial + VIP
         abogado_id, abogado_nombre, abogado_tel = pick_abogado_secuencial(ws_abog, ws_sys, salario, syscfg)
 
         salario_min_diario = safe_float(syscfg.get("SALARIO_MIN_DIARIO") or "0")
 
-        # ✅ cálculo sin 20 días
         desglose_txt, total_estimado, comp = calc_estimacion_detallada(
             tipo_caso=tipo_caso,
             salario_mensual=salario,
@@ -614,7 +595,6 @@ def process_lead(lead_id: str):
             salario_min_diario=salario_min_diario
         )
 
-        # ✅ análisis web consultivo (GPT + Conocimiento_AI)
         con_rows = []
         try:
             ws_con = open_worksheet(sh, TAB_CONOCIMIENTO_AI)
@@ -647,7 +627,6 @@ def process_lead(lead_id: str):
             if tnorm:
                 link_abog = f"https://wa.me/{tnorm.replace('+','')}"
 
-        # WhatsApp: SOLO TOTAL + link web
         mensaje_final = (
             f"✅ {nombre}, ya tengo tu *estimación preliminar*.\n\n"
             f"💰 *Total estimado:* ${total_estimado:,.2f}\n\n"
@@ -658,9 +637,8 @@ def process_lead(lead_id: str):
             mensaje_final += f"\n📄 Ver desglose en web: {link_reporte}\n"
         mensaje_final += "\n(Orientación informativa; no constituye asesoría legal.)"
 
-        # Guardar en Sheets (Web toma esto)
         update_row_cells(ws_leads, row, {
-            "Analisis_AI": analisis_web,          # ✅ ahora es análisis consultivo (web)
+            "Analisis_AI": analisis_web,
             "Resultado_Calculo": desglose_txt,
             "Total_Estimado": f"{total_estimado:.2f}",
 
@@ -674,9 +652,8 @@ def process_lead(lead_id: str):
             "Fecha_Fin_Laboral": fin.isoformat(),
             "Es_Cliente": "1",
 
-            # componentes
             "Indemnizacion_90": f"{comp['Indemnizacion_90']:.2f}",
-            "Indemnizacion_20": f"{comp['Indemnizacion_20']:.2f}",  # ✅ 0
+            "Indemnizacion_20": f"{comp['Indemnizacion_20']:.2f}",
             "Prima_Antiguedad": f"{comp['Prima_Antiguedad']:.2f}",
             "Aguinaldo_Prop": f"{comp['Aguinaldo_Prop']:.2f}",
             "Vacaciones_Prop": f"{comp['Vacaciones_Prop']:.2f}",
@@ -687,10 +664,8 @@ def process_lead(lead_id: str):
             "Ultima_Actualizacion": now_iso(),
         }, hmap=h)
 
-        # Crear registro en Abogados_Admin (si existe)
         upsert_abogados_admin(sh, lead_id, abogado_id)
 
-        # Enviar WhatsApp
         ok1, det1 = send_whatsapp_safe(telefono, mensaje_final)
 
         if ok1:

@@ -1,0 +1,316 @@
+<div id="tdlm-report" class="tdlm">
+  <style>
+    .tdlm{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial; color:#0B1F33;}
+    .tdlm .wrap{max-width:980px;margin:0 auto;padding:18px 14px 48px;}
+    .tdlm .card{background:#fff;border:1px solid rgba(11,31,51,.10);border-radius:18px;box-shadow:0 10px 30px rgba(11,31,51,.08);overflow:hidden}
+    .tdlm .head{padding:18px 18px 14px;border-bottom:1px solid rgba(11,31,51,.08);display:flex;gap:12px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+    .tdlm .title{font-size:28px;line-height:1.15;margin:0;font-weight:800;letter-spacing:-.02em}
+    .tdlm .sub{margin:6px 0 0;color:rgba(11,31,51,.68);font-size:14px}
+    .tdlm .badge{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border-radius:999px;background:rgba(176,141,87,.12);color:#6F5322;font-weight:700;font-size:12px}
+    .tdlm .hero{padding:18px}
+    .tdlm .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}
+
+    .tdlm .box{border:1px solid rgba(11,31,51,.10);border-radius:16px;padding:14px;background:linear-gradient(180deg, rgba(255,255,255,1), rgba(11,31,51,.02))}
+    .tdlm .k{font-size:12px;color:rgba(11,31,51,.62);margin:0 0 6px}
+    .tdlm .v{font-size:16px;margin:0;font-weight:800}
+
+    /* ✅ Enfatizar asignación */
+    .tdlm .assign{
+      margin-top:12px;
+      border:1px solid rgba(11,31,51,.10);
+      border-left:6px solid #B08D57;
+      background:#fbfaf7;
+      border-radius:14px;
+      padding:12px 12px;
+      font-weight:800;
+      line-height:1.35;
+    }
+    .tdlm .assign small{
+      display:block;
+      margin-top:6px;
+      font-weight:600;
+      color:rgba(11,31,51,.70);
+    }
+
+    .tdlm .total{border-radius:16px;padding:16px;background:#0B1F33;color:#fff}
+    .tdlm .total .k{color:rgba(255,255,255,.75)}
+    .tdlm .total .amt{font-size:34px;font-weight:900;letter-spacing:-.02em;margin:6px 0 0}
+
+    .tdlm .sec{padding:0 18px 18px}
+    .tdlm h3{margin:18px 0 10px;font-size:16px;letter-spacing:-.01em}
+    .tdlm .muted{color:rgba(11,31,51,.70);font-size:14px;line-height:1.5}
+    .tdlm .table{border:1px solid rgba(11,31,51,.10);border-radius:16px;overflow:hidden}
+    .tdlm .row{display:flex;justify-content:space-between;gap:14px;padding:12px 14px;border-top:1px solid rgba(11,31,51,.08)}
+    .tdlm .row:first-child{border-top:none}
+    .tdlm .row .l{font-weight:700}
+    .tdlm .row .r{font-weight:900}
+    .tdlm .row.sub{background:rgba(11,31,51,.02)}
+    .tdlm .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:rgba(11,31,51,.05);font-weight:800;font-size:12px}
+    .tdlm .pre{white-space:pre-wrap;background:#0B1F33;color:#fff;border-radius:16px;padding:14px;font-size:13px;line-height:1.45}
+    .tdlm .warn{margin-top:10px;padding:12px 12px;border-radius:14px;border:1px solid rgba(180,0,0,.20);background:rgba(255,0,0,.06);color:#7a1111;font-weight:800}
+    .tdlm .foot{margin-top:12px;font-size:12px;color:rgba(11,31,51,.65)}
+
+    /* ✅ CTAs al final */
+    .tdlm .next{
+      margin-top:16px;
+      padding:14px;
+      border-radius:16px;
+      background:#0B1F33;
+      color:#fff;
+    }
+    .tdlm .next .nt{font-weight:900;margin:0 0 10px}
+    .tdlm .btns2{display:flex;flex-direction:column;gap:10px}
+    .tdlm .btn{
+      display:inline-flex;align-items:center;justify-content:center;gap:8px;
+      padding:13px 14px;border-radius:12px;text-decoration:none;
+      font-weight:900;font-size:14px;border:1px solid rgba(11,31,51,.14);
+      background:#fff;color:#0B1F33
+    }
+    .tdlm .btn.primary{background:#B08D57;color:#0B1F33;border-color:transparent}
+    .tdlm .btn.ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.35)}
+    @media (max-width: 860px){.tdlm .grid{grid-template-columns:1fr}}
+  </style>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="head">
+        <div>
+          <h1 class="title">Estimación de Prestaciones</h1>
+          <p class="sub">Reporte referencial con desglose y próximos pasos.</p>
+        </div>
+        <div class="badge">⚖️ Orientación informativa</div>
+      </div>
+
+      <div class="hero">
+        <div class="grid">
+          <div class="box">
+            <p class="k">Cliente</p>
+            <p class="v" id="tdlm-cliente">—</p>
+
+            <!-- ✅ Asignación con énfasis (y decodificación) -->
+            <div class="assign" id="tdlm-asignacion" data-decode-entities="1">—</div>
+          </div>
+
+          <div class="total">
+            <p class="k">Total estimado</p>
+            <div class="amt" id="tdlm-total">$—</div>
+            <div class="foot" id="tdlm-periodo" style="color:rgba(255,255,255,.80);">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>Análisis consultivo</h3>
+        <div class="muted" id="tdlm-resumen">—</div>
+
+        <h3>Datos considerados</h3>
+        <div class="table">
+          <div class="row"><div class="l">Salario mensual considerado</div><div class="r" id="tdlm-salario">$—</div></div>
+          <div class="row sub"><div class="l">Salario diario (aprox.)</div><div class="r" id="tdlm-sd">$—</div></div>
+          <div class="row"><div class="l">Antigüedad estimada</div><div class="r" id="tdlm-antig">—</div></div>
+          <div class="row sub"><div class="l">Tipo de caso</div><div class="r" id="tdlm-tipo">—</div></div>
+        </div>
+
+        <h3>Desglose (conceptos)</h3>
+        <div class="table" id="tdlm-desglose">
+          <div class="row" id="row-90"><div class="l">Indemnización 90 días</div><div class="r" id="tdlm-90">$—</div></div>
+          <div class="row sub"><div class="l">Prima de antigüedad (12 días/año)</div><div class="r" id="tdlm-pa">$—</div></div>
+          <div class="row"><div class="l">Aguinaldo proporcional</div><div class="r" id="tdlm-agu">$—</div></div>
+          <div class="row sub"><div class="l">Vacaciones proporcionales</div><div class="r" id="tdlm-vac">$—</div></div>
+          <div class="row"><div class="l">Prima vacacional proporcional</div><div class="r" id="tdlm-pv">$—</div></div>
+          <div class="row sub"><div class="l"><span class="pill">Total</span></div><div class="r" id="tdlm-total-2">$—</div></div>
+        </div>
+
+        <h3>Detalle completo (referencial)</h3>
+        <div class="pre" id="tdlm-detalle">—</div>
+
+        <div class="foot" style="margin-top:12px;">
+          Este reporte es referencial. El monto puede variar por salario integrado real, topes vigentes, prestaciones adicionales,
+          salarios caídos y documentación (recibos, contrato, IMSS, etc.).
+        </div>
+
+        <!-- ✅ Botones hasta el final (evita confusión) -->
+        <div class="next">
+          <p class="nt">Siguientes pasos</p>
+          <div class="btns2">
+            <a class="btn primary" id="tdlm-wa-abog" href="#" target="_blank" rel="noopener" style="display:none;">
+              Abrir WhatsApp con tu abogada
+            </a>
+            <a class="btn ghost" href="https://tuderecholaboralmexico.com/abogados/" target="_blank" rel="noopener">
+              Conoce al equipo legal
+            </a>
+          </div>
+          <div class="foot" style="color:rgba(255,255,255,.75);margin-top:10px">
+            Si no te abre WhatsApp, copia el enlace o vuelve a intentarlo desde el navegador.
+          </div>
+        </div>
+
+        <div class="warn" id="tdlm-error" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      const API_BASE = "https://ximena-obc1.onrender.com/api/report";
+
+      const $ = (id)=>document.getElementById(id);
+      const errBox = $("tdlm-error");
+
+      function showError(msg){
+        errBox.style.display = "block";
+        errBox.textContent = msg;
+      }
+
+      function parseNumber(x){
+        if (x === null || x === undefined) return NaN;
+        const s = String(x).replace(/\$/g,"").replace(/,/g,"").trim();
+        const n = Number(s);
+        return Number.isFinite(n) ? n : NaN;
+      }
+
+      function money(n){
+        if (!Number.isFinite(n)) return "$—";
+        return n.toLocaleString("es-MX",{style:"currency",currency:"MXN"});
+      }
+
+      function getFirst(obj, keys){
+        for (const k of keys){
+          if (obj && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") return obj[k];
+        }
+        return "";
+      }
+
+      function safeText(x){ return (x===null||x===undefined) ? "" : String(x); }
+
+      // ✅ Decodifica entidades HTML (por si Divi/WordPress re-escapa el emoji)
+      function decodeOnce(str){
+        const t = document.createElement("textarea");
+        t.innerHTML = str;
+        return t.value;
+      }
+      function decodeTwice(str){
+        return decodeOnce(decodeOnce(str));
+      }
+      function decodeEntitiesOnPage(){
+        document.querySelectorAll('[data-decode-entities="1"]').forEach(el=>{
+          const raw = (el.textContent || "").trim();
+          if(!raw) return;
+          let fixed = decodeTwice(raw);
+          fixed = fixed.replace(/👩‍⚖️?/ig, "👩‍⚖️");
+          el.textContent = fixed;
+        });
+      }
+
+      const params = new URLSearchParams(window.location.search);
+      const token = params.get("token") || "";
+
+      if (!token){
+        showError("Falta el parámetro ?token= en la URL.");
+        return;
+      }
+      if (!API_BASE){
+        showError("Falta configurar API_BASE.");
+        return;
+      }
+
+      const joiner = (a,b)=>[a,b].filter(Boolean).join(" ").trim();
+
+      const url = (API_BASE.includes("?"))
+        ? `${API_BASE}&token=${encodeURIComponent(token)}&v=${Date.now()}`
+        : `${API_BASE}?token=${encodeURIComponent(token)}&v=${Date.now()}`;
+
+      fetch(url, { cache:"no-store" })
+        .then(r => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
+        .then(json => {
+          if (!json || json.ok !== true){
+            throw new Error((json && json.error) ? json.error : "Respuesta inválida");
+          }
+
+          const data = json.data || {};
+
+          // Cliente
+          const nombre = safeText(getFirst(data, ["Nombre","nombre"]));
+          const apellido = safeText(getFirst(data, ["Apellido","apellido"]));
+          $("tdlm-cliente").textContent = joiner(nombre || "—", apellido);
+
+          // WhatsApp abogada
+          const linkWA = safeText(getFirst(data, ["Link_WhatsApp","link_whatsapp","whatsapp_abog"]));
+          if (linkWA){
+            const a = $("tdlm-wa-abog");
+            a.href = linkWA;
+            a.style.display = "inline-flex";
+          }
+
+          // Periodo
+          const ini = safeText(getFirst(data, ["Fecha_Inicio_Laboral","fecha_inicio_laboral"]));
+          const fin = safeText(getFirst(data, ["Fecha_Fin_Laboral","fecha_fin_laboral"]));
+          $("tdlm-periodo").textContent = (ini && fin) ? `Periodo: ${ini} → ${fin}` : "Periodo: —";
+
+          // Análisis consultivo (web)
+          const resumen = safeText(getFirst(data, ["Analisis_AI","analisis_ai"]));
+          $("tdlm-resumen").innerHTML = resumen
+            ? resumen.replace(/\n\n+/g,"<br><br>").replace(/\n/g,"<br>").replace(/•\s*/g,"• ")
+            : "—";
+
+          // Datos considerados
+          const salarioMensual = parseNumber(getFirst(data, ["Salario_Mensual","salario_mensual"]));
+          $("tdlm-salario").textContent = money(salarioMensual);
+
+          const sd = Number.isFinite(salarioMensual) ? (salarioMensual/30.0) : NaN;
+          $("tdlm-sd").textContent = money(sd);
+
+          const antig = safeText(getFirst(data, ["Antiguedad","antiguedad"]));
+          $("tdlm-antig").textContent = antig ? antig : "—";
+
+          const tipo = safeText(getFirst(data, ["Tipo_Caso","tipo_caso"]));
+          $("tdlm-tipo").textContent = (tipo==="1") ? "Despido" : (tipo==="2") ? "Renuncia" : (tipo || "—");
+
+          // Desglose
+          const n90 = parseNumber(getFirst(data, ["Indemnizacion_90","indemnizacion_90"]));
+          const nPA = parseNumber(getFirst(data, ["Prima_Antiguedad","prima_antiguedad"]));
+          const nAgu = parseNumber(getFirst(data, ["Aguinaldo_Prop","aguinaldo_prop"]));
+          const nVac = parseNumber(getFirst(data, ["Vacaciones_Prop","vacaciones_prop"]));
+          const nPV  = parseNumber(getFirst(data, ["Prima_Vac_Prop","prima_vac_prop"]));
+
+          $("tdlm-90").textContent = money(n90);
+          $("tdlm-pa").textContent = money(nPA);
+          $("tdlm-agu").textContent = money(nAgu);
+          $("tdlm-vac").textContent = money(nVac);
+          $("tdlm-pv").textContent = money(nPV);
+
+          // si no es despido o 90 = 0, ocultar fila 90
+          if (tipo !== "1" || !Number.isFinite(n90) || n90 <= 0){
+            const r90 = document.getElementById("row-90");
+            if (r90) r90.style.display = "none";
+          }
+
+          // Total
+          const total = parseNumber(getFirst(data, ["Total_Estimado","total_estimado"]));
+          $("tdlm-total").textContent = money(total);
+          $("tdlm-total-2").textContent = money(total);
+
+          // Detalle completo
+          const detalle = safeText(getFirst(data, ["Resultado_Calculo","resultado_calculo"]));
+          $("tdlm-detalle").textContent = detalle || "—";
+
+          // Asignación (con énfasis)
+          const abog = safeText(getFirst(data, ["Abogado_Asignado_Nombre","abogado_asignado_nombre"]));
+          const asign = abog
+            ? `👩‍⚖️ Abogada asignada: ${abog}.`
+            : `👩‍⚖️ Abogada asignada: (por confirmar).`;
+
+          const follow = "En breve te contactaremos por WhatsApp para continuar tu caso.";
+
+          const box = $("tdlm-asignacion");
+          box.innerHTML = `${asign}<small>${follow}</small>`;
+
+          // ✅ por si algo viene escapado
+          decodeEntitiesOnPage();
+        })
+        .catch(e => {
+          showError("No se pudo cargar el reporte. Revisa: (1) token, (2) que Render tenga /api/report, (3) CORS. Detalle: " + e.message);
+        });
+    })();
+  </script>
+</div>
