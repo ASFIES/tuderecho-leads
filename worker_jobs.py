@@ -428,7 +428,7 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
         for t in temas[:3]:
             title = t.get("Titulo_Visible") or "Punto legal relevante"
             bullets.append(f"• {title}")
-        bullets_txt = "\n".join(bullets) if bullets else "• Revisión de causa/forma del evento y prestaciones.\n• Validación de salario real/integrado.\n• Confirmación de pagos pendientes y documentos."
+        bullets_txt = "\n".join(bullets) if bullets else "• Revisión de causa/forma del evento y prestaciones.\n• Validación de salario real/integrado.\n• Confirmación de pagos pendientes y documentos, haz una explicación  no muy tecnica de las situacion  y de cada punto y el para que  debe ser de forma empatica con sentido legal pero con leguaje sencillo en 150 palabras."
 
         return (
             f"{nombre}, lamento la situación y gracias por confiar en nosotros.\n\n"
