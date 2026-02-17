@@ -411,7 +411,7 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
 
     def fallback():
         txt = (
-            f"{nombre}, gracias por contarnos tu situación. Con lo que compartiste, parece un caso de *{tipo_h}* "
+            f"{nombre}, gracias por contarnos tu situación. Con lo que compartiste, parece un caso de {tipo_h} "
             f"con una antigüedad aproximada de {antig_txt}. Este análisis es preliminar: el monto final puede ajustarse "
             "al confirmar salario real (o integrado), pagos previos y la documentación disponible.\n\n"
             "Para avanzar con seguridad te recomendamos:\n"
@@ -426,7 +426,6 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
     if not (OPENAI_API_KEY and OpenAI):
         return fallback()
 
-    # Contexto breve desde Conocimiento_AI (sin saturar)
     contexto_items = []
     for t in (temas or [])[:3]:
         titulo = (t.get("Titulo_Visible") or "Punto legal relevante").strip()
@@ -447,7 +446,7 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
                     "Eres un asistente legal en derecho laboral mexicano. "
                     "Escribe con tono humano, cálido y profesional. "
                     "Explica en lenguaje sencillo, sin tecnicismos pesados. "
-                    "No uses Markdown (no **negritas**). "
+                    "No uses Markdown. "
                     "Texto final de 130 a 170 palabras. "
                     "Puedes usar hasta 3 viñetas con '•'. "
                     "NO incluyas la leyenda final; el sistema la añadirá."
@@ -486,7 +485,7 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
         # ✅ Por si GPT mete la leyenda (la quitamos y ponemos la nuestra)
         txt = re.sub(r"(?is)\n*orientación informativa;.*$", "", txt).strip()
 
-        # ✅ Recorte seguro a ~150–165 palabras si se pasa
+        # ✅ Recorte seguro
         if len(txt.split()) > 175:
             txt = _clip_words(txt, 165)
 
@@ -496,16 +495,25 @@ def build_analisis_web_gpt(nombre: str, tipo_caso: str, descripcion: str, salari
         return fallback()
 
 
+# --------------------
+# ✅ CAMBIO CLAVE: Abogados_Admin debe generar ID_Admin (Key de AppSheet)
+# --------------------
 def upsert_abogados_admin(sh, lead_id: str, abogado_id: str):
     """
     Crea (si no existe) registro en Abogados_Admin con:
-      ID_Lead, ID_Abogado, Estatus, Acepto_Asesoria, Enviar_Cuestionario, Proxima_Fecha_Evento, Notas
+      ID_Admin, ID_Lead, ID_Abogado, Estatus, Acepto_Asesoria, Enviar_Cuestionario, Proxima_Fecha_Evento, Notas
+
+    ✅ Fix AppSheet:
+    - Si tu KEY en AppSheet es ID_Admin, entonces SIEMPRE debemos llenarlo.
+    - Generamos un ID_Admin único (uuid corto).
+    - Si ya existe por ID_Lead, solo actualiza abogado/estatus y NO crea duplicado.
     """
     try:
         ws = open_worksheet(sh, TAB_ABOG_ADMIN)
     except Exception:
-        return
+        return  # si no existe, no rompe
 
+    # si ya existe (por ID_Lead), solo actualiza
     try:
         existing = find_row_by_value(ws, "ID_Lead", lead_id)
         if existing:
@@ -525,6 +533,10 @@ def upsert_abogados_admin(sh, lead_id: str, abogado_id: str):
             c = col_idx(h, col)
             if c and 1 <= c <= len(row_out):
                 row_out[c - 1] = val
+
+        # ✅ Generar ID_Admin (si existe la columna)
+        id_admin = uuid.uuid4().hex[:12]  # corto pero suficientemente único
+        set_cell("ID_Admin", id_admin)
 
         set_cell("ID_Lead", lead_id)
         set_cell("ID_Abogado", abogado_id)
@@ -664,6 +676,7 @@ def process_lead(lead_id: str):
             "Ultima_Actualizacion": now_iso(),
         }, hmap=h)
 
+        # ✅ ahora sí crea registro con ID_Admin
         upsert_abogados_admin(sh, lead_id, abogado_id)
 
         ok1, det1 = send_whatsapp_safe(telefono, mensaje_final)
